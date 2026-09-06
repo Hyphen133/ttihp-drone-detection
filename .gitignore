@@ -1,0 +1,21 @@
+# Local Python and editor state
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# Simulation outputs
+sim_build/
+results.xml
+*.vcd
+*.fst
+*.fst.hier
+test/gate_level_netlist.v
+
+# TinyTapeout / LibreLane generated outputs
+runs/
+tt_submission/
+src/user_config.json
+src/config_merged.json
+src/config_*.json
+!src/config.json
