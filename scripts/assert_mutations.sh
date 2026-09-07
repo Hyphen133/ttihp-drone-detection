@@ -24,7 +24,7 @@
 # A_HOLD_STEP, which looks like a catch but is an artifact of the mutation.
 # See docs/hold_width.md.
 #
-#   ./scripts/assert_mutations.sh        # every mutation, ~1 min
+#   ./scripts/assert_mutations.sh        # every mutation, ~45 s
 #   CASE=test_dc_input_bit_exact ./scripts/assert_mutations.sh
 #
 # Everything runs on copies under a temp dir; src/ and test/ are never touched.
@@ -33,7 +33,11 @@ cd "$(dirname "$0")/.."
 
 IMAGE=${IMAGE:-ww-ci-sim:latest}
 # test_hold_duration walks several frames in ~0.8 s, which is enough to reach
-# S_ROLL, a fire and the hold decrement -- the states the runtime checks need.
+# S_ROLL and the hold decrement. It parks the trim at 127 so that nothing
+# fires, and test_detector_matches_model runs at the trim-62 operating point,
+# where this stimulus fires nothing either. The fire mutation therefore names
+# test_trim_raises_threshold, whose trim-1 pass fires three windows and asserts
+# that it does.
 CASE=${CASE:-test_hold_duration}
 RTL=src/tt_um_hyphen133_drone_detection.sv
 WORK=$(mktemp -d)
@@ -47,7 +51,7 @@ trap cleanup EXIT
 MUTATIONS=(
 "hold_width_too_narrow|-|A_HOLD_FITS|s/localparam HOLD_W   = .*/localparam HOLD_W = 1;/"
 "hold_never_expires|-|A_HOLD_EXPIRES|s/if \(hold != 0\) hold <= hold - 1'b1;/if (hold != 0) hold <= hold;/"
-"fire_loads_wrong_value|-|A_FIRE_LOADS_HOLD|s/hold <= HOLD_W'\(HOLD_FRAMES\)/hold <= HOLD_W'(1)/"
+"fire_loads_wrong_value|test_trim_raises_threshold|A_FIRE_LOADS_HOLD|s/hold <= HOLD_W'\(HOLD_FRAMES\)/hold <= HOLD_W'(1)/"
 "hold_decrements_by_two|-|A_HOLD_STEP|s/hold <= hold - 1'b1;/hold <= hold - 2'd2;/"
 "roll_skips_idle|-|A_ROLL_TO_IDLE|s/(if \(hold != 0\) hold <= hold - 1'b1;\s*\n\s*cnt <= cnt \+ 1'b1;\s*\n\s*st  <= )S_IDLE;/\${1}S_CASC;/"
 "hval_sign_dropped|-|A_HVAL_SIGN|s/hval = acc_next\[HACC_W-1\]        \?/hval = 1'b0                     ?/"
@@ -60,8 +64,8 @@ MUTATIONS=(
 )
 
 pass=0; fail=0
-printf '%-24s %-20s %s\n' MUTATION MUST-FIRE RESULT
-printf '%s\n' "$(printf '%.0s-' {1..68})"
+printf '%-24s %-34s %s\n' MUTATION MUST-SHOW RESULT
+printf '%s\n' "$(printf '%.0s-' {1..82})"
 
 for m in "${MUTATIONS[@]}"; do
   IFS='|' read -r name tcase want prog <<<"$m"
@@ -73,27 +77,29 @@ for m in "${MUTATIONS[@]}"; do
 
   perl -0777 -pe "$prog" "$RTL" > "$d/$RTL"
   if cmp -s "$d/$RTL" "$RTL"; then
-    printf '%-24s %-20s %s\n' "$name" "$want" "BROKEN (pattern did not match)"
+    printf '%-24s %-34s %s\n' "$name" "$want" "BROKEN (pattern did not match)"
     fail=$((fail+1)); continue
   fi
 
   # --user keeps the build products owned by the caller; without it docker
   # writes sim_build and __pycache__ as root and the temp dir cannot be removed.
+  # TESTCASE is what cocotb 1.x reads; COCOTB_TESTCASE is the 2.x name. With
+  # only the latter, every mutation silently ran the whole suite.
   out=$(docker run --rm --user "$(id -u):$(id -g)" -v "$d":/work -w /work/test \
-        -e COCOTB_TESTCASE="$tcase" -e HOME=/tmp "$IMAGE" \
+        -e TESTCASE="$tcase" -e COCOTB_TESTCASE="$tcase" -e HOME=/tmp "$IMAGE" \
         bash -lc 'timeout 300 make 2>&1' 2>&1)
 
   if grep -q "$want" <<<"$out"; then
-    printf '%-24s %-20s %s\n' "$name" "$want" "caught"
+    printf '%-24s %-34s %s\n' "$name" "$want" "caught"
     pass=$((pass+1))
   else
     fired=$(grep -oE 'A_[A-Z_]+:' <<<"$out" | tr -d ':' | sort -u | tr '\n' ' ')
-    printf '%-24s %-20s %s\n' "$name" "$want" \
+    printf '%-24s %-34s %s\n' "$name" "$want" \
       "NOT CAUGHT${fired:+ -- fired instead: $fired}"
     fail=$((fail+1))
   fi
 done
 
-printf '%s\n' "$(printf '%.0s-' {1..68})"
+printf '%s\n' "$(printf '%.0s-' {1..82})"
 echo "caught $pass of $((pass+fail))"
 [ "$fail" -eq 0 ]

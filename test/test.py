@@ -543,7 +543,7 @@ async def test_band_dynamic_range(dut):
     assert hi - lo >= 4, f"ramp only spanned levels {lo}..{hi}; not exercising the encoder"
 
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test()
 async def test_unused_inputs_ignored(dut):
     """uio_in and ena change nothing: outputs identical, features bit-exact.
 
@@ -556,14 +556,24 @@ async def test_unused_inputs_ignored(dut):
 
     Same stimulus twice. The reference run parks the pins; the second walks a
     counter across uio_in, so every bit moves both ways, and drops ena for 16
-    of every 32 mic ticks. The second run must be bit-exact against the golden
-    model, which knows nothing of either pin, and its uo_out/uio_out/uio_oe
-    trace must equal the reference clock for clock, debug pins included.
+    of every 32 mic ticks. The second run's uo_out/uio_out/uio_oe trace must
+    equal the reference clock for clock, debug pins included, and in the fast
+    pass its frames must also be bit-exact against the golden model, which
+    knows nothing of either pin.
+
+    This one runs in every pass. The clock-for-clock comparison needs no
+    frame boundary, so at FRAME_LOG2=16 and on the netlist -- where a frame
+    costs ~1 min and ~4 min -- it runs a sixteenth of a frame and drops only
+    the golden check, which needs whole frames and is the fast pass's job.
     """
     cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
     cfg = test_cfg()
-    n_frames = min(NFRAMES_RUN, 4)
-    bits = make_pdm(n_frames << cfg.frame_log2, cfg, seed=7)
+    if FAST_ONLY:
+        n_frames, n_ticks = 0, 1 << (cfg.frame_log2 - 4)
+    else:
+        n_frames = min(NFRAMES_RUN, 4)
+        n_ticks = n_frames << cfg.frame_log2
+    bits = make_pdm(n_ticks, cfg, seed=7)
 
     async def run(wiggle):
         b = Bench(dut, cfg)
@@ -587,13 +597,15 @@ async def test_unused_inputs_ignored(dut):
     ref_trace, ref_frames = await run(wiggle=False)
     got_trace, got_frames = await run(wiggle=True)
 
-    golden = [list(g) for g in golden_frames(bits, cfg, n_frames)]
-    n = min(len(got_frames), len(golden))
-    assert n >= 3, f"only captured {n} frames"
-    bad = [i for i in range(n) if got_frames[i] != golden[i]]
-    for i in bad[:5]:
-        dut._log.error(f"frame {i}: RTL {got_frames[i]} golden {golden[i]}")
-    assert not bad, f"{len(bad)}/{n} frames not bit-exact with uio_in/ena moving"
+    n = 0
+    if n_frames:
+        golden = [list(g) for g in golden_frames(bits, cfg, n_frames)]
+        n = min(len(got_frames), len(golden))
+        assert n >= 3, f"only captured {n} frames"
+        bad = [i for i in range(n) if got_frames[i] != golden[i]]
+        for i in bad[:5]:
+            dut._log.error(f"frame {i}: RTL {got_frames[i]} golden {golden[i]}")
+        assert not bad, f"{len(bad)}/{n} frames not bit-exact with uio_in/ena moving"
 
     assert len(got_trace) == len(ref_trace), "runs are different lengths"
     diff = [i for i, (r, g) in enumerate(zip(ref_trace, got_trace)) if r != g]
@@ -602,4 +614,4 @@ async def test_unused_inputs_ignored(dut):
         dut._log.error(f"clk {i}: parked {ref_trace[i]} vs moving {got_trace[i]}")
     assert not diff, f"{len(diff)}/{len(ref_trace)} clocks differ once uio_in/ena move"
     dut._log.info(f"{n} frames bit-exact and {len(ref_trace)} clocks identical "
-                  f"with uio_in walking and ena toggling")
+                  f"with uio_in walking and ena toggling ({n_ticks} ticks)")

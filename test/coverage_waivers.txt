@@ -23,8 +23,8 @@ all :: toggle :: ^toggle uio_oe\[ :: DEBUG_PINS=1: uio_oe is the constant 8'hFF 
 
 # --- unreachable by construction ---------------------------------------
 all :: line :: default: st <= S_IDLE :: st is 2 bits and S_IDLE..S_ROLL name all four encodings; the default arm has no value to take.
-all :: toggle :: ^toggle x_in\[ :: x_in is pdm_bit ? +IN_AMP : -IN_AMP, two constants; only the 3 bits that differ between +128 and -128 can move.
-all :: toggle :: ^toggle bmag\[[89]\]|^toggle bexp\[4\] :: |band| <= 192: a state in [-128,127] and an input in the same range give d=in-st in [-255,255] and band = d - (d>>>2), so bmag < 256 and bexp <= 8.
+all :: toggle :: ^toggle x_in\[[0-7]\]: :: x_in is pdm_bit ? +IN_AMP : -IN_AMP, two constants: +128 = 00_1000_0000 and -128 = 11_1000_0000 differ only in bits 9..8, bits 6..0 are 0 in both and bit 7 is 1 in both. Bits 9..8 stay in the count.
+all :: toggle :: ^toggle bmag\[[89]\]|^toggle bexp\[4\] :: |band| <= 192: the state stays in [-128,127] (from 0, s + ((128-s)>>>2) never reaches 128), the input is a state or x_in = +-128, so d = in-st is in [-255,256] and band = d - (d>>>2) peaks at 192; bmag < 256 and bexp <= 8.
 all :: branch,expr :: wide > 9'\(FEAT_MAX\) :: bexp <= 8 (above) and MANT=1 give wide = ((bexp-1)<<1)|m <= 15 = FEAT_MAX; the saturate arm cannot fire.
 all :: branch :: cond_then @ .*\|hsh\[HACC_W-1:4\] :: HACC_W=6, HSHIFT=1: acc_next <= 31, so hsh <= 15 whenever acc_next is non-negative and the clamp-to-15 arm is dead; negative goes to 0 in the outer arm.
 all :: toggle :: ^toggle hval_s\[[456]\] :: hval_s is a 4-bit unsigned hval zero-extended to OSUM_W=7; bits 6..4 are wired 0.
