@@ -39,7 +39,13 @@
 
   "//": "Save some time",
   "RUN_KLAYOUT_XOR": 0,
-  "RUN_KLAYOUT_DRC": 0,
+
+  "//": "Second-opinion DRC signoff. The TT default leaves this off to save",
+  "//": "runtime, which means Magic is the only DRC deck that runs. The",
+  "//": "ihp-sg13g2 PDK does ship a KLayout deck (KLAYOUT_DRC_RUNSET ->",
+  "//": "libs.tech/klayout/tech/drc/ihp-sg13g2.drc), so enabling this is a real",
+  "//": "independent check rather than a skipped step.",
+  "RUN_KLAYOUT_DRC": 1,
 
   "//": "Don't put clock buffers on the outputs",
   "DESIGN_REPAIR_BUFFER_OUTPUT_PORTS": 0,
@@ -62,6 +68,13 @@
 
   "//": "Clock",
   "RUN_CTS": 1,
+
+  "//": "Cap the sinks per clock-tree leaf cluster. LibreLane leaves this unset,",
+  "//": "so TritonCTS uses its own default of 20 and the leaf buffers ended up",
+  "//": "driving 11-17 flops each -- 14 max-fanout violations against the",
+  "//": "sg13g2 MAX_FANOUT_CONSTRAINT of 10, in all three corners. 8 keeps every",
+  "//": "leaf inside the library rule with a little headroom.",
+  "CTS_SINK_CLUSTERING_SIZE": 8,
 
   "//": "Don't generate power rings",
   "FP_PDN_MULTILAYER": 0,
