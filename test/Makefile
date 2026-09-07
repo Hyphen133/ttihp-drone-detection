@@ -20,6 +20,12 @@ SIM_BUILD        = sim_build/rtl_f$(FRAME_LOG2)
 VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
 COMPILE_ARGS    += -g2012
 COMPILE_ARGS    += -DWW_FRAME_LOG2=$(FRAME_LOG2)
+# Design assertions (the block at the bottom of the RTL). RTL only: they read
+# internal signals, and src/config.json never defines this, so nothing
+# synthesised is affected. WW_ASSERT=0 turns them off.
+ifneq ($(WW_ASSERT),0)
+COMPILE_ARGS    += -DWW_ASSERT
+endif
 
 else
 

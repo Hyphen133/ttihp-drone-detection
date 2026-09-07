@@ -22,7 +22,10 @@
 //      reaches the required capacity. NPHASE staggered copies mean detection
 //      does not depend on alignment with a window boundary.
 //   7. Output layer: one ternary weight per hidden unit; over threshold ->
-//      latch the LED for HOLD_FRAMES.
+//      hold the LED for HOLD_FRAMES-1 frames. A drone is a steady source
+//      that is still there on the next window, so the output tracks it at
+//      41.9 ms rather than latching: at the old 16 the LED lagged the
+//      aircraft by 629 ms and ran two passes together into one.
 //
 // The fixed drone_2 template weights come from drone_weights.svh. Ternary
 // weights cost nothing here: a zero drops that term from the adder tree.
@@ -78,7 +81,12 @@ module tt_um_hyphen133_drone_detection #(
                                     // feature before the adder tree; keeps
                                     // the accumulator and bias small     // hidden requantise: clamp(acc>>HSHIFT,0,15)
     parameter SCORE_W      = 10,
-    parameter HOLD_FRAMES  = 16,
+    // LED hold. `hold` is loaded in S_CLASS and decremented in the S_ROLL of
+    // that same frame, so the LED stays up for HOLD_FRAMES-1 whole frames:
+    // 2 is one frame, 41.9 ms. 1 is not the floor it looks like -- the load
+    // and the decrement fall in the same frame, so it would blink for the few
+    // hundred clocks of S_CLASS and never be seen.
+    parameter HOLD_FRAMES  = 2,
     parameter DEBUG_PINS   = 1      // 0: uo_out[7:4] and uio_out driven low
 ) (
     input  wire [7:0] ui_in,    // [0] PDM data in, [7:1] threshold trim
@@ -109,6 +117,12 @@ module tt_um_hyphen133_drone_detection #(
   // rotates only during those steps and is back in order for the classifier.
   localparam AVG_STG0 = TAP0 + NBAND - AVG_N;
   localparam FIDX_W   = $clog2(NFRAME);
+  // Width of the LED hold counter. Sized from HOLD_FRAMES and NOT from FIDX_W,
+  // which it used to share. That coupling held only by luck: FIDX_W+1 is 5
+  // bits at this build's NFRAME=16, so 5'(16) fitted -- but the same source
+  // with NFRAME=8 gives a 4-bit counter, 4'(16) truncates to zero and the LED
+  // never asserts at all. See docs/hold_width.md.
+  localparam HOLD_W   = $clog2(HOLD_FRAMES + 1);
   localparam HOP      = NFRAME / NPHASE;
   localparam CNT_W    = FRAME_LOG2 + FIDX_W;
   localparam STG_W    = $clog2(NSTAGE + 1);
@@ -172,7 +186,7 @@ module tt_um_hyphen133_drone_detection #(
   // OSUM_W bits; the compare against the SCORE_W-bit threshold sign-extends.
   localparam OSUM_W = $clog2(NHID * 15 + 1) + 1;
   logic signed [OSUM_W-1:0]  osum;
-  logic        [FIDX_W:0]    hold;
+  logic        [HOLD_W-1:0]  hold;
 
   logic [CNT_W-1:0]  cnt;          // mic-tick counter: framing + decimation
   logic [STG_W-1:0]  stg;          // cascade step
@@ -387,7 +401,7 @@ module tt_um_hyphen133_drone_detection #(
           for (i = 0; i < NSLOT - 1; i++) hacc[i] <= hacc[i + 1];
           hacc[NSLOT-1] <= acc_next;
           if (win_end) osum <= osum_next;
-          if (fire) hold <= (FIDX_W+1)'(HOLD_FRAMES);
+          if (fire) hold <= HOLD_W'(HOLD_FRAMES);
           if (slot == SLOT_W'(NSLOT - 1)) st <= S_ROLL;
           else                            slot <= slot + 1'b1;
         end
@@ -430,6 +444,136 @@ module tt_um_hyphen133_drone_detection #(
   endgenerate
 
   wire _unused = &{ena, uio_in, 1'b0};
+
+  // ---------------------------------------------------------------------
+  // Assertions
+  //
+  // Enabled by -DWW_ASSERT, which test/Makefile sets on every RTL build and
+  // src/config.json never sets, so this block does not reach synthesis --
+  // verified by re-running the flow and diffing the netlist, which came out
+  // byte-identical. These
+  // are immediate assertions on purpose: iverilog rejects `property`,
+  // `assert property` and `bind` outright, so concurrent SVA would mean
+  // moving the whole suite to another simulator.
+  //
+  // The point of putting them here rather than writing more testbenches is
+  // that they hold under *every* stimulus. All seven cocotb tests, both
+  // weight builds and both frame lengths become scenario coverage for them,
+  // and so does anything added later.
+  //
+  // What this is a reaction to: the wake-word sibling of this design shipped
+  // a hardened part whose hold counter was too narrow for HOLD_FRAMES, so its
+  // LED could never assert. This build escaped it only because NFRAME=16
+  // happens to make FIDX_W+1 wide enough. A
+  // -Wall lint pass (measured, verilator 5.052) does not catch it -- the
+  // truncating cast is explicit, which silences WIDTHTRUNC -- and neither does
+  // comparing against the golden model in a run that never fires. It is a
+  // value invariant, and A_HOLD_FITS below is the check it needed.
+  // ---------------------------------------------------------------------
+`ifdef WW_ASSERT
+  // Elaboration time: parameters that must survive being loaded into the
+  // registers that hold them, and the arithmetic each one assumes.
+  // iverilog rejects a label on an immediate assertion, so each check carries
+  // its name in the failure message instead.
+  initial begin
+    // A_HOLD_FITS. This is the one that bug needed.
+    // Measured against $bits(hold) -- the width the register was actually
+    // declared with -- not against HOLD_W. Checking the localparam would pass
+    // happily if the declaration were ever wired to some other parameter
+    // again, which is precisely the bug this is here to stop.
+    //
+    // Stated as a range rather than a round-trip cast on purpose: iverilog
+    // evaluates HOLD_W'(HOLD_FRAMES) as -2 in an expression context (it
+    // assigns correctly, so the RTL above is fine), the same family of
+    // width-cast bug as the yosys -N'(x) one that rectified the mic input.
+    assert (HOLD_FRAMES < (1 << $bits(hold)))
+      else $fatal(1, "A_HOLD_FITS: HOLD_FRAMES=%0d needs more than the %0d bits hold has",
+                  HOLD_FRAMES, $bits(hold));
+    // A_HOLD_VISIBLE. 1 loads and decrements in the same frame, so it would
+    // blink for the few hundred clocks of S_CLASS and never be seen.
+    assert (HOLD_FRAMES >= 2)
+      else $fatal(1, "A_HOLD_VISIBLE: HOLD_FRAMES=%0d gives no visible output",
+                  HOLD_FRAMES);
+    // A_NFRAME_POW2. c_slot subtracts the phase offset in FIDX_W bits and
+    // relies on the wrap, which is modulo NFRAME only for a power of two.
+    assert (NFRAME == (1 << FIDX_W))
+      else $fatal(1, "A_NFRAME_POW2: NFRAME=%0d is not a power of two", NFRAME);
+    // A_HOP_EXACT. HOP = NFRAME/NPHASE must be exact or the phases drift.
+    assert (NFRAME % NPHASE == 0)
+      else $fatal(1, "A_HOP_EXACT: NPHASE=%0d does not divide NFRAME=%0d",
+                  NPHASE, NFRAME);
+    // A_BANDS_EXIST. Every band must be a real cascade tap.
+    assert (TAP0 + NBAND <= NSTAGE)
+      else $fatal(1, "A_BANDS_EXIST: TAP0+NBAND=%0d exceeds NSTAGE=%0d",
+                  TAP0 + NBAND, NSTAGE);
+    // A_FEAT_OFF. Subtracted from every feature before the adder tree.
+    assert (FEAT_OFF < (1 << FEAT_W))
+      else $fatal(1, "A_FEAT_OFF: FEAT_OFF=%0d exceeds the feature range",
+                  FEAT_OFF);
+  end
+
+  logic fire_q;
+  logic [1:0] st_q;
+  logic [HOLD_W-1:0] hold_q;
+  always_ff @(posedge clk) begin
+    fire_q <= rst_n && fire && (st == S_CLASS);
+    st_q   <= rst_n ? st : S_IDLE;
+    hold_q <= rst_n ? hold : '0;
+  end
+
+  always @(posedge clk) if (rst_n) begin
+    // A_FIRE_LOADS_HOLD. A fire must light the LED with the whole hold
+    // loaded, which is the runtime form of A_HOLD_FITS. Checked a cycle late
+    // because `hold` is a register; at most one fire lands per frame (the two
+    // phases reach win_end in different frames), so this never races itself.
+    assert (!fire_q || hold == HOLD_FRAMES)
+      else $error("A_FIRE_LOADS_HOLD: fire left hold=%0d, expected %0d",
+                  hold, HOLD_FRAMES);
+    // A_HOLD_BOUND. HOLD_W rounds up, so the counter has room to hold values
+    // above HOLD_FRAMES and this can genuinely fail: at HOLD_FRAMES=2 the
+    // register reaches 3.
+    assert (hold <= HOLD_FRAMES)
+      else $error("A_HOLD_BOUND: hold=%0d above HOLD_FRAMES=%0d",
+                  hold, HOLD_FRAMES);
+    // A_HOLD_STEP. Per cycle the only legal moves are load, decrement by one,
+    // and unchanged -- unchanged is legal because `hold` only ever moves in
+    // S_ROLL, so it sits still for the rest of the frame.
+    assert (hold == hold_q || hold == HOLD_FRAMES
+                           || (hold_q != 0 && hold == hold_q - 1'b1))
+      else $error("A_HOLD_STEP: hold %0d -> %0d", hold_q, hold);
+    // A_HOLD_EXPIRES. That leniency is not enough on its own: "unchanged"
+    // also covers a counter stuck on forever, which is a permanently lit LED
+    // and the one failure a user of the board would actually see. So pin the
+    // frame boundary too -- after an S_ROLL cycle a nonzero hold must have
+    // come down by exactly one. Nothing loads `hold` in S_ROLL (a fire is in
+    // S_CLASS), so there is no legal exception.
+    //
+    // scripts/assert_mutations.sh found this gap: a `hold <= hold` mutation in
+    // the S_ROLL arm passed A_HOLD_STEP cleanly.
+    assert (st_q != S_ROLL || hold_q == 0 || hold == hold_q - 1'b1)
+      else $error("A_HOLD_EXPIRES: S_ROLL left hold %0d -> %0d", hold_q, hold);
+    // A_STG_BOUND. STG_W rounds up past NSTAGE, so running off the end of the
+    // cascade is representable.
+    assert (stg <= NSTAGE)
+      else $error("A_STG_BOUND: stg=%0d past NSTAGE=%0d", stg, NSTAGE);
+    // A_HVAL_SIGN. The requantise is clamp(acc >> HSHIFT, 0, 15); a negative
+    // accumulator must come out as 0, not as a wrapped positive. This is the
+    // sign handling the golden model assumes.
+    assert (!acc_next[HACC_W-1] || hval == 4'd0)
+      else $error("A_HVAL_SIGN: acc_next=%0d gave hval=%0d", acc_next, hval);
+    // A_ROLL_TO_IDLE. S_ROLL clears the frame statistics and is always
+    // followed by S_IDLE; a transition anywhere else would carry one frame's
+    // maxima into the next.
+    assert (st_q != S_ROLL || st == S_IDLE)
+      else $error("A_ROLL_TO_IDLE: S_ROLL went to %0d, not S_IDLE", st);
+    // A_NO_X_OUT. Nothing observable may be X once reset is released. Written
+    // as an XOR-reduction identity test because iverilog's $isunknown returns
+    // 1 for any concatenation, even an all-zero one -- it is only correct on a
+    // single signal.
+    assert ((^{uo_out, uio_out, uio_oe}) !== 1'bx)
+      else $error("A_NO_X_OUT: uo=%b uio=%b oe=%b", uo_out, uio_out, uio_oe);
+  end
+`endif
 
 endmodule
 

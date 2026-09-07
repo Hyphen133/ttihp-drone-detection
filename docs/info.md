@@ -18,14 +18,18 @@ The multiplier-free integer pipeline is:
 5. Accumulate four 16×5 ternary templates in signed six-bit saturating
    accumulators. Two staggered windows reduce boundary sensitivity.
 6. Requantize the hidden activations, apply the ternary output layer, compare
-   against the trimmed threshold, and hold a detection for sixteen frames.
+   against the trimmed threshold, and hold a detection for one 41.9 ms
+   frame. The hold is deliberately short: a drone is a steady source that
+   is still there on the next window, so the output tracks it instead of
+   latching. An earlier build held for 629 ms, which lagged the aircraft
+   and ran two passes together into one.
 
 The `drone_2` weights reached 98.92% test AUC on the DADS evaluation split.
 Reference hardening of the same logic completed in one IHP sg13g2 1×1 tile at
 94.60% final core utilization with clean DRC, LVS, antenna, setup, and hold
 checks.
 
-![Reference drone_2 layout](drone_2_layout.png)
+![Reference drone_4 layout](drone_4_layout.png)
 
 ## How to test
 
