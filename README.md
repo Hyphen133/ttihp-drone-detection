@@ -79,11 +79,16 @@ ramp, and that `uio_in` and `ena` change nothing -- the same stimulus with those
 pins parked and with them moving must give identical outputs, clock for clock.
 They also check every debug/output pin against a non-zero internal snapshot and
 drive a guaranteed real classifier fire through all four detection outputs.
-Six expensive behavioural checks run in the fast pass only. The real-fire test
-also runs against the full-length tape-out RTL; only the gate-level pass skips
-it because reaching the first staggered decision takes eight ~170 s frames.
-The unused-pins check runs in every pass, on a sixteenth of a frame where a
-whole frame is expensive.
+The full-length RTL pass omits six behavioural checks already covered by the
+fast parameter-equivalent RTL build. The gate-level pass runs all fourteen:
+tests that inspect or deposit RTL registers have public-pin gate variants, and
+classifier tests run far enough to close a real staggered window. This makes
+the gate job several hours long, but prevents a green netlist run whose
+detection output never asserted. The unused-pins check remains shortened to a
+sixteenth of a frame because its clock-for-clock comparison needs no frame
+boundary. Here "complete gate-level suite" means all named public-interface
+behaviours execute on the netlist; the separate 100% waived coverage figure is
+an RTL logic-coverage measurement, not a standard-cell-netlist toggle claim.
 
 Every RTL build also compiles the `WW_ASSERT` block at the bottom of the RTL:
 six elaboration-time parameter checks and eight per-cycle invariants on the

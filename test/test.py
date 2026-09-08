@@ -40,10 +40,13 @@ HOLD_FRAMES_VISIBLE = HOLD_FRAMES - 1
 # Frame period of the build that tapes out, independent of the shortened
 # FRAME_LOG2 the fast run uses.
 TAPEOUT_FRAME_MS = (1 << 16) / (drone_model.PDM_HZ / 1000.0)
-# The fast RTL build only: behavioural checks that do not need the tape-out
-# frame length, where a frame costs ~2 s, or the netlist, where it costs
-# ~170 s. Keeping them out of those passes is what stops the suite growing.
-FAST_ONLY = GATES or FRAME_LOG2 > 10
+# A full-length RTL run duplicates the bit-exact checks at the tape-out frame
+# length, but does not need to repeat every behavioural corner case.  The gate
+# run is different: it is the manufactured logic we need to exercise, even
+# though a frame is expensive there.  In particular, do not include GATES in
+# this skip condition -- every registered test must execute on the netlist.
+FULL_LENGTH_RTL = not GATES and FRAME_LOG2 > 10
+SLOW_BUILD = GATES or FRAME_LOG2 > 10
 
 
 def test_cfg():
@@ -179,6 +182,112 @@ def led(dut):
     return (int(dut.uo_out.value) >> 3) & 1
 
 
+def assert_detection_outputs(dut):
+    """All four public detection indications must be the same value."""
+    uo = int(dut.uo_out.value)
+    mirrored = (uo >> 1) & 0b111
+    debug_detect = (int(dut.uio_out.value) >> 4) & 1
+    assert mirrored in (0, 0b111), f"detection mirrors disagree: {mirrored:03b}"
+    assert debug_detect == int(mirrored != 0), \
+        "uio detection debug disagrees with uo"
+    return int(mirrored != 0)
+
+
+async def drive_until_detection(dut, b, cfg, trim=0):
+    """Drive a guaranteed-fire trim until the public detection output rises."""
+    _, _, _, trained_threshold = load_weights()
+    effective_threshold = trained_threshold + ((trim - 64) << 2)
+    assert effective_threshold < -(NHID * 15), \
+        "requested trim does not guarantee a classifier fire"
+
+    # The first staggered window closes on frame NFRAME/NPHASE-1.  One extra
+    # frame is a guard against ending on the same simulator delta as S_CLASS.
+    n_frames = cfg.nframe // cfg.nphase + 1
+    prev_st, frames = read_state(dut), 0
+    for tick_i in range(n_frames << cfg.frame_log2):
+        b.set_bit(tick_i & 1, trim)
+        for _ in range(PDM_DIV):
+            await RisingEdge(dut.clk)
+            st = read_state(dut)
+            if st == S_CLASS and prev_st != S_CLASS:
+                frames += 1
+            prev_st = st
+            if assert_detection_outputs(dut):
+                return frames
+    assert False, f"no detection in {frames} completed frames at trim={trim}"
+
+
+# Gate simulation is roughly four minutes per frame.  Cache campaigns whose
+# single trace proves more than one named property; each test still runs the
+# campaign itself when selected alone with TESTCASE/COCOTB_TESTCASE.
+_gate_fire_evidence = None
+_gate_threshold_evidence = None
+
+
+async def gate_fire_campaign(dut, b, cfg):
+    """One natural fire proving assertion, mirrors, release and hold length."""
+    global _gate_fire_evidence
+    if _gate_fire_evidence is not None:
+        return _gate_fire_evidence
+
+    n_frames = cfg.nframe // cfg.nphase + HOLD_FRAMES
+    prev_st, saw_high, saw_release = read_state(dut), False, False
+    frame_entries, states = 0, set()
+    visible_frames = 0
+    for tick_i in range(n_frames << cfg.frame_log2):
+        b.set_bit(tick_i & 1, trim=0)
+        for _ in range(PDM_DIV):
+            await RisingEdge(dut.clk)
+            detect = assert_detection_outputs(dut)
+            st = read_state(dut)
+            states.add(st)
+            if st == S_CLASS and prev_st != S_CLASS:
+                frame_pin = int(dut.uio_out.value) & 0x0F
+                assert frame_pin == (frame_entries & 0x0F), \
+                    f"frame-index debug pins={frame_pin}, expected {frame_entries & 0x0F}"
+                frame_entries += 1
+                if detect:
+                    visible_frames += 1
+            prev_st = st
+            if detect:
+                saw_high = True
+            elif saw_high:
+                saw_release = True
+    assert states == {0, 1, 2, 3}, f"state debug pins missed an FSM state: {states}"
+    assert frame_entries >= n_frames, \
+        f"only {frame_entries}/{n_frames} public frame boundaries observed"
+    _gate_fire_evidence = {
+        "saw_high": saw_high,
+        "saw_release": saw_release,
+        "visible_frames": visible_frames,
+    }
+    return _gate_fire_evidence
+
+
+async def gate_threshold_campaign(dut, b, cfg):
+    """Observe adjacent trim values on opposite sides of a known score."""
+    global _gate_threshold_evidence
+    if _gate_threshold_evidence is not None:
+        return _gate_threshold_evidence
+
+    n_frames = cfg.nframe // cfg.nphase
+    bits = [i & 1 for i in range(n_frames << cfg.frame_log2)]
+    fired = {}
+    for trim in (56, 57):
+        await b.reset()
+        n, prev = 0, 0
+        for bit in bits:
+            b.set_bit(bit, trim)
+            for _ in range(PDM_DIV):
+                await RisingEdge(dut.clk)
+                cur = assert_detection_outputs(dut)
+                n += cur and not prev
+                prev = cur
+        fired[trim] = n
+    _gate_threshold_evidence = fired
+    return fired
+
+
 def signed(value, width):
     """Interpret an unsigned simulator value as a width-bit two's complement."""
     value = int(value)
@@ -200,6 +309,10 @@ async def capture_frames(dut, b, bits, n_frames):
             await RisingEdge(dut.clk)
             st = read_state(dut)
             if st == S_CLASS and prev_st != S_CLASS:
+                if GATES:
+                    frame_pin = int(dut.uio_out.value) & 0x0F
+                    assert frame_pin == (len(got) & 0x0F), \
+                        f"frame-index debug pins={frame_pin}, expected {len(got) & 0x0F}"
                 got.append(read_fmax(dut, b.cfg.nband))
             prev_st = st
     return got
@@ -321,7 +434,7 @@ async def test_detector_matches_model(dut):
             prev_st = st
     assert frames >= min(4, NFRAMES_RUN), f"only classified {frames} frames"
     assert mism == 0, f"{mism}/{frames} frames disagreed on the LED"
-    if not FAST_ONLY:
+    if not SLOW_BUILD:
         assert saw_equal_threshold, \
             "stimulus no longer lands exactly on the threshold; strict-compare check is vacuous"
     dut._log.info(f"{frames} frames: LED matches the model, "
@@ -360,7 +473,7 @@ async def test_mic_clock_period(dut):
                   f"tape-out frame {TAPEOUT_FRAME_MS:.2f} ms")
 
 
-@cocotb.test(skip=GATES)
+@cocotb.test()
 async def test_debug_pin_mapping(dut):
     """Every documented output bit is driven by the intended internal signal.
 
@@ -373,6 +486,39 @@ async def test_debug_pin_mapping(dut):
     cfg = test_cfg()
     b = Bench(dut, cfg)
     await b.reset()
+
+    if GATES:
+        # Synthesis does not preserve a stable internal hierarchy to deposit.
+        # Check the same mapping from natural, independently predictable state:
+        # reset fixes frame/state/detect/fmax at zero, while the divider and
+        # sequencer exercise tick, mic-clock, IDLE and CASC in a few periods.
+        assert int(dut.uio_oe.value) == 0xFF, "debug build must drive every uio pin"
+        assert int(dut.uio_out.value) & 0x7F == 0, \
+            "frame/state/detect debug pins not clear after reset"
+        assert int(dut.uo_out.value) >> 1 == 0, \
+            "detection/fmax outputs not clear after reset"
+
+        tick_gaps, last_tick, tick_width, states = [], None, 0, set()
+        for cycle in range(4 * PDM_DIV):
+            await RisingEdge(dut.clk)
+            uio = int(dut.uio_out.value)
+            states.add((uio >> 5) & 0b11)
+            assert (uio & 0x0F) == 0, "frame-index pins changed before a frame ended"
+            assert_detection_outputs(dut)
+            tick = (uio >> 7) & 1
+            if tick:
+                tick_width += 1
+                if last_tick is not None:
+                    tick_gaps.append(cycle - last_tick)
+                last_tick = cycle
+            elif tick_width:
+                assert tick_width == 1, f"tick debug pulse was {tick_width} clocks wide"
+                tick_width = 0
+        assert len(tick_gaps) >= 2 and all(g == PDM_DIV for g in tick_gaps), \
+            f"tick debug gaps {tick_gaps}, expected {PDM_DIV}"
+        assert {0, 1} <= states, f"state debug pins did not show IDLE and CASC: {states}"
+        return
+
     clock_task.kill()
 
     async def check_snapshot(div, hold, fmax0, state, frame):
@@ -398,7 +544,7 @@ async def test_debug_pin_mapping(dut):
     await check_snapshot(div=PDM_DIV // 2, hold=0, fmax0=0x3, state=3, frame=0x5)
 
 
-@cocotb.test(skip=GATES)
+@cocotb.test()
 async def test_real_fire_drives_detection_outputs(dut):
     """A real classifier decision must assert and then release every detect pin.
 
@@ -411,6 +557,14 @@ async def test_real_fire_drives_detection_outputs(dut):
     cfg = test_cfg()
     b = Bench(dut, cfg)
     await b.reset()
+
+    if GATES:
+        evidence = await gate_fire_campaign(dut, b, cfg)
+        assert evidence["saw_high"], \
+            "guaranteed-low threshold never produced a real classifier fire"
+        assert evidence["saw_release"], \
+            "detection outputs did not release after the configured hold"
+        return
 
     trim = 0
     _, _, _, trained_threshold = load_weights()
@@ -428,12 +582,8 @@ async def test_real_fire_drives_detection_outputs(dut):
         b.set_bit(tick_i & 1, trim)
         for _ in range(PDM_DIV):
             await RisingEdge(dut.clk)
-            uo = int(dut.uo_out.value)
-            mirrored = (uo >> 1) & 0b111
-            debug_detect = (int(dut.uio_out.value) >> 4) & 1
-            assert mirrored in (0, 0b111), f"detection mirrors disagree: {mirrored:03b}"
-            assert debug_detect == int(mirrored != 0), "uio detection debug disagrees with uo"
-            if mirrored:
+            detect = assert_detection_outputs(dut)
+            if detect:
                 saw_high = True
             elif saw_high:
                 saw_release = True
@@ -441,7 +591,7 @@ async def test_real_fire_drives_detection_outputs(dut):
     assert saw_high, "guaranteed-low threshold never produced a real classifier fire"
     assert saw_release, "detection outputs did not release after the configured hold"
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test(skip=FULL_LENGTH_RTL)
 async def test_hold_duration(dut):
     """The LED stays up for exactly HOLD_FRAMES-1 frames after a fire.
 
@@ -456,6 +606,15 @@ async def test_hold_duration(dut):
     cfg = test_cfg()
     b = Bench(dut, cfg)
     await b.reset()
+
+    if GATES:
+        # The natural-fire campaign is shared with the preceding output test;
+        # when this testcase is selected alone it runs the campaign here.
+        evidence = await gate_fire_campaign(dut, b, cfg)
+        frames = evidence["visible_frames"]
+        assert frames == HOLD_FRAMES_VISIBLE, \
+            f"LED held {frames} frames, expected {HOLD_FRAMES_VISIBLE}"
+        return
 
     assert int(dut.user_project.HOLD_FRAMES.value) == HOLD_FRAMES, \
         (f"RTL HOLD_FRAMES={int(dut.user_project.HOLD_FRAMES.value)}, test "
@@ -483,7 +642,7 @@ async def test_hold_duration(dut):
     dut._log.info(f"LED holds {frames} frame(s) = "
                   f"{frames * TAPEOUT_FRAME_MS:.1f} ms at the tape-out frame length")
 
-@cocotb.test(skip=GATES)
+@cocotb.test()
 async def test_reset_clears_led(dut):
     """Reset drops a held LED instead of leaving it lit.
 
@@ -492,11 +651,15 @@ async def test_reset_clears_led(dut):
     and a stuck LED is the one failure a user of the board would see.
     """
     cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
-    b = Bench(dut, test_cfg())
+    cfg = test_cfg()
+    b = Bench(dut, cfg)
     await b.reset()
 
-    dut.user_project.hold.value = HOLD_FRAMES
-    await RisingEdge(dut.clk)
+    if GATES:
+        await drive_until_detection(dut, b, cfg)
+    else:
+        dut.user_project.hold.value = HOLD_FRAMES
+        await RisingEdge(dut.clk)
     assert led(dut), "LED did not follow a loaded hold"
 
     dut.rst_n.value = 0
@@ -505,7 +668,7 @@ async def test_reset_clears_led(dut):
     assert (int(dut.uo_out.value) >> 1) & 0b111 == 0, "a detection survived reset"
     dut._log.info("reset clears the hold counter")
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test(skip=FULL_LENGTH_RTL)
 async def test_dc_input_bit_exact(dut):
     """A stuck mic is still bit-exact against the golden front end.
 
@@ -521,12 +684,12 @@ async def test_dc_input_bit_exact(dut):
     for name, bit in (("stuck low", 0), ("stuck high", 1)):
         b = Bench(dut, cfg)
         await b.reset()
-        n_frames = min(NFRAMES_RUN, 6)
+        n_frames = 3 if GATES else min(NFRAMES_RUN, 6)
         bits = [bit] * (n_frames << cfg.frame_log2)
         dut._log.info(f"--- mic {name} ---")
         await check_bit_exact(dut, b, bits, n_frames, min_frames=3)
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test(skip=FULL_LENGTH_RTL)
 async def test_trim_raises_threshold(dut):
     """Turning the trim up must not produce more detections.
 
@@ -538,11 +701,19 @@ async def test_trim_raises_threshold(dut):
     """
     cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
     cfg = test_cfg()
+    if GATES:
+        b = Bench(dut, cfg)
+        await b.reset()
+        fires = await gate_threshold_campaign(dut, b, cfg)
+        assert fires[56] > fires[57], f"raising trim did not suppress detection: {fires}"
+        return
+
     n_frames = min(NFRAMES_RUN, 24)
     bits = make_pdm(n_frames << cfg.frame_log2, cfg, seed=5)
 
     fires = {}
-    for trim in (1, 64, 127):
+    trims = (1, 64, 127)
+    for trim in trims:
         b = Bench(dut, cfg)
         await b.reset()
         n, prev = 0, 0
@@ -555,11 +726,12 @@ async def test_trim_raises_threshold(dut):
                 prev = cur
         fires[trim] = n
     dut._log.info(f"detections by trim: {fires}")
-    assert fires[1] >= fires[64] >= fires[127], \
+    counts = [fires[t] for t in trims]
+    assert all(a >= b for a, b in zip(counts, counts[1:])), \
         f"trim is not monotonic: {fires}"
-    assert fires[1] > 0, "no detection at the lowest trim -- stimulus too weak to test"
+    assert counts[0] > 0, "no detection at the lowest trim -- stimulus too weak to test"
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test(skip=FULL_LENGTH_RTL)
 async def test_reset_mid_frame_recovers(dut):
     """Reset part-way through a frame must leave the chip as good as cold.
 
@@ -573,23 +745,37 @@ async def test_reset_mid_frame_recovers(dut):
     b = Bench(dut, cfg)
     await b.reset()
 
-    # Run 1.5 frames so the reset lands with fmax and cnt part-way populated.
-    stale = make_pdm(2 << cfg.frame_log2, cfg, seed=11)
-    await capture_frames(dut, b, stale, 1)
-    await ClockCycles(dut.clk, (1 << (cfg.frame_log2 - 1)) * PDM_DIV)
-    assert int(dut.user_project.cnt.value) != 0, "not mid-frame; the test proves nothing"
+    # Run half a frame.  The public frame-index remains zero, while a non-zero
+    # fmax debug value proves this is populated mid-frame state rather than a
+    # second cold reset.
+    stale_ticks = (1 << (cfg.frame_log2 - 1)) if GATES else (3 << (cfg.frame_log2 - 1))
+    stale = make_pdm(stale_ticks, cfg, seed=11)
+    for bit in stale:
+        b.set_bit(bit)
+        await ClockCycles(dut.clk, PDM_DIV)
+    if GATES:
+        assert (int(dut.uio_out.value) & 0x0F) == 0, "not in the first partial frame"
+        assert (int(dut.uo_out.value) >> 4) != 0, "stimulus did not populate frame state"
+    else:
+        assert int(dut.user_project.cnt.value) != 0, "not mid-frame; the test proves nothing"
 
     await b.reset()
-    assert int(dut.user_project.cnt.value) == 0, "cnt survived reset"
     assert not led(dut), "LED survived reset"
-    assert all(int(dut.user_project.fmax[i].value) == 0 for i in range(cfg.nband)), \
-        "a frame maximum survived reset"
+    if GATES:
+        assert (int(dut.uio_out.value) & 0x6F) == 0, \
+            "frame/state public state survived reset"
+        assert (int(dut.uo_out.value) >> 1) == 0, \
+            "detection/fmax public state survived reset"
+    else:
+        assert int(dut.user_project.cnt.value) == 0, "cnt survived reset"
+        assert all(int(dut.user_project.fmax[i].value) == 0 for i in range(cfg.nband)), \
+            "a frame maximum survived reset"
 
-    n_frames = min(NFRAMES_RUN, 6)
+    n_frames = 3 if GATES else min(NFRAMES_RUN, 6)
     bits = make_pdm(n_frames << cfg.frame_log2, cfg)
     await check_bit_exact(dut, b, bits, n_frames, min_frames=3)
 
-@cocotb.test(skip=GATES)
+@cocotb.test()
 async def test_threshold_trim_arithmetic(dut):
     """thresh == WW_THRESH_PK + ((trim - 64) << 2) across the whole trim range.
 
@@ -606,6 +792,19 @@ async def test_threshold_trim_arithmetic(dut):
     await b.reset()
 
     _, _, _, thr = load_weights()
+    if GATES:
+        # Internal combinational nets have no stable name after synthesis, so
+        # observe the arithmetic at the classifier boundary.  For alternating
+        # input the first staggered window scores -15.  The specified formula
+        # gives thresholds -18 and -14 at adjacent trims 56 and 57, hence the
+        # former must fire and the latter must not.  This checks sign, scale,
+        # offset and strict comparison through the actual netlist outputs.
+        cfg = test_cfg()
+        fired = await gate_threshold_campaign(dut, b, cfg)
+        assert fired[56] == 1 and fired[57] == 0, \
+            f"threshold boundary is wrong for score -15: {fired}"
+        return
+
     span = 1 << 10                                   # SCORE_W, for wraparound
     seen = set()
     for trim in (0, 127, 0x55, 0x2A, 1, 126, 64, 63, 65, 32, 96):
@@ -620,7 +819,7 @@ async def test_threshold_trim_arithmetic(dut):
     dut._log.info(f"threshold correct at {len(seen)} trim points, "
                   f"thr={thr} range [{thr - 256}, {thr + 252}]")
 
-@cocotb.test(skip=FAST_ONLY)
+@cocotb.test(skip=FULL_LENGTH_RTL)
 async def test_band_dynamic_range(dut):
     """A quiet-to-loud ramp, bit-exact, spanning the log encoder's range.
 
@@ -663,7 +862,9 @@ async def test_band_dynamic_range(dut):
     lo = min(min(f) for f in got[:n])
     hi = max(max(f) for f in got[:n])
     dut._log.info(f"{n} frames bit-exact on the ramp; feature levels {lo}..{hi}")
-    assert hi - lo >= 4, f"ramp only spanned levels {lo}..{hi}; not exercising the encoder"
+    min_span = 1 if GATES else 4  # only band 0 is public on the netlist
+    assert hi - lo >= min_span, \
+        f"ramp only spanned observable levels {lo}..{hi}; not exercising the encoder"
 
 
 @cocotb.test()
@@ -691,7 +892,7 @@ async def test_unused_inputs_ignored(dut):
     """
     cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
     cfg = test_cfg()
-    if FAST_ONLY:
+    if SLOW_BUILD:
         n_frames, n_ticks = 0, 1 << (cfg.frame_log2 - 4)
     else:
         n_frames = min(NFRAMES_RUN, 4)

@@ -68,7 +68,7 @@ Worth recording, because all three of the obvious defences failed:
 * **Comparing against the golden model does not see it either**, unless the run
   actually fires. That part applies to this repo too -- see below.
 
-## The gate-level pass cannot see the LED
+## The gate-level pass must see the LED
 
 A window has to fire before the LED can be compared to anything, and with
 `NPHASE=2` the staggered phase's boundary comes into reach at frame
@@ -79,19 +79,25 @@ tests:
 |---|---|---|
 | `FRAME_LOG2=8` | 40 | yes |
 | `FRAME_LOG2=16` | 8 | yes |
-| gate-level | 5 | **no** |
+| gate-level baseline equivalence | 5 | **no** |
+| gate-level real-fire/hold tests | 10 | **yes** |
 
-A frame costs ~8 ms, ~2 s and ~170 s respectively, which is why the slow passes
-run so few. The gate-level pass -- the one run against the netlist that
-actually tapes out -- compares a permanently-low LED against a permanently-low
-model and agrees no matter what the output stage does.
+A frame costs ~8 ms, ~2 s and several minutes respectively. The baseline
+gate-level equivalence check therefore remains five frames, but it is no longer
+the only gate-level evidence. Every named test executes on the netlist, and the
+dedicated real-fire and hold checks run through the first staggered decision
+and its release. Tests that deposit `hold` in RTL instead cause a guaranteed
+real classifier fire and observe only public outputs on the netlist.
 
 `test_detector_matches_model` runs at `trim = 58`, where this deterministic
 stimulus lands exactly on the threshold. That checks that equality does not
 fire and that classifier arithmetic does not invent a detection. A separate
 `test_real_fire_drives_detection_outputs` uses a threshold below the output
 layer's mathematical minimum, reaches a real staggered-window decision without
-forcing DUT state, and checks assertion and release on every detection pin.
+forcing DUT state, and checks assertion and release on every detection pin in
+both RTL and gate-level simulation. The gate-level threshold-boundary test also
+uses adjacent trims 56 and 57 around a known score of -15: one must fire and
+the other must not.
 
 ## What holds it now
 

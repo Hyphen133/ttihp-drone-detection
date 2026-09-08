@@ -37,6 +37,49 @@ jobs:
       - name: GL test
         uses: TinyTapeout/tt-gds-action/gl_test@ttihp26b
 
+      - name: Require the complete gate-level suite
+        shell: bash
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          expected = {
+              "test_reset",
+              "test_frontend_bit_exact",
+              "test_detector_matches_model",
+              "test_mic_clock_period",
+              "test_debug_pin_mapping",
+              "test_real_fire_drives_detection_outputs",
+              "test_hold_duration",
+              "test_reset_clears_led",
+              "test_dc_input_bit_exact",
+              "test_trim_raises_threshold",
+              "test_reset_mid_frame_recovers",
+              "test_threshold_trim_arithmetic",
+              "test_band_dynamic_range",
+              "test_unused_inputs_ignored",
+          }
+          root = ET.parse("test/results.xml").getroot()
+          cases = {case.attrib["name"]: case for case in root.iter("testcase")}
+          missing = expected - cases.keys()
+          unexpected = cases.keys() - expected
+          skipped = {
+              name for name in cases
+              if cases[name].find("skipped") is not None
+          }
+          failed = {
+              name for name in cases
+              if any(cases[name].find(tag) is not None for tag in ("failure", "error"))
+          }
+          if missing or unexpected or skipped or failed:
+              raise SystemExit(
+                  f"missing: {sorted(missing)}; unexpected: {sorted(unexpected)}; "
+                  f"skipped: {sorted(skipped)}; "
+                  f"failed/error: {sorted(failed)}"
+              )
+          print("verified all 14 gate-level tests passed with none skipped")
+          PY
+
   viewer:
     needs: gds
     runs-on: ubuntu-24.04
