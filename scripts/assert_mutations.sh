@@ -24,7 +24,7 @@
 # A_HOLD_STEP, which looks like a catch but is an artifact of the mutation.
 # See docs/hold_width.md.
 #
-#   ./scripts/assert_mutations.sh        # every mutation, ~45 s
+#   ./scripts/assert_mutations.sh        # every mutation
 #   CASE=test_dc_input_bit_exact ./scripts/assert_mutations.sh
 #
 # Everything runs on copies under a temp dir; src/ and test/ are never touched.
@@ -34,10 +34,9 @@ cd "$(dirname "$0")/.."
 IMAGE=${IMAGE:-ww-ci-sim:latest}
 # test_hold_duration walks several frames in ~0.8 s, which is enough to reach
 # S_ROLL and the hold decrement. It parks the trim at 127 so that nothing
-# fires, and test_detector_matches_model runs at the trim-62 operating point,
-# where this stimulus fires nothing either. The fire mutation therefore names
-# test_trim_raises_threshold, whose trim-1 pass fires three windows and asserts
-# that it does.
+# fires, and test_detector_matches_model deliberately exercises equality at
+# the threshold without firing. The fire-load mutation therefore names
+# test_trim_raises_threshold, whose trim-1 pass fires and asserts that it does.
 CASE=${CASE:-test_hold_duration}
 RTL=src/tt_um_hyphen133_drone_detection.sv
 WORK=$(mktemp -d)
@@ -61,6 +60,9 @@ MUTATIONS=(
 # fail. Same discipline -- a test that has never failed is not evidence.
 "uio_in_read_as_data|test_unused_inputs_ignored|test_unused_inputs_ignored *FAIL|s/x_in = pdm_bit \?/x_in = (pdm_bit ^ uio_in[0]) ?/"
 "ena_gates_sampling|test_unused_inputs_ignored|test_unused_inputs_ignored *FAIL|s/\}\}\}\) pdm_bit <= ui_in\[0\];/}}} \&\& ena) pdm_bit <= ui_in[0];/"
+"fire_disabled|test_real_fire_drives_detection_outputs|test_real_fire_drives_detection_outputs *FAIL|s/wire fire = /wire fire = 1'b0 \&\& /"
+"detection_mirror_broken|test_debug_pin_mapping|test_debug_pin_mapping *FAIL|s/assign uo_out\[2\] = detect;/assign uo_out[2] = 1'b0;/"
+"threshold_compare_inclusive|test_detector_matches_model|test_detector_matches_model *FAIL|s/osum_w > thresh/osum_w >= thresh/"
 )
 
 pass=0; fail=0

@@ -70,40 +70,46 @@ make                         # shortened frames, suitable for quick checks
 FRAME_LOG2=16 make           # exact tape-out frame length
 ```
 
-Twelve tests, ~50 s for the fast pass. They check reset and clock behaviour,
+Fourteen tests check reset and clock behaviour,
 every filterbank frame against the model, the detector output trace, the exact
 mic-clock divider, the LED hold length in frames, reset of a lit LED, a mic
 stuck at either rail, trim monotonicity and the threshold arithmetic across the
 trim range, recovery from a mid-frame reset, bit-exactness on a quiet-to-loud
 ramp, and that `uio_in` and `ena` change nothing -- the same stimulus with those
 pins parked and with them moving must give identical outputs, clock for clock.
-Six of them need whole frames, so they run in the fast pass only; the unused-pins check runs in every pass, on a sixteenth of a frame where a frame is expensive -- a frame costs ~2 s at `FRAME_LOG2=16` and ~170 s on the netlist, and
-that fence is what keeps the slow passes the length they already were.
+They also check every debug/output pin against a non-zero internal snapshot and
+drive a guaranteed real classifier fire through all four detection outputs.
+Six expensive behavioural checks run in the fast pass only. The real-fire test
+also runs against the full-length tape-out RTL; only the gate-level pass skips
+it because reaching the first staggered decision takes eight ~170 s frames.
+The unused-pins check runs in every pass, on a sixteenth of a frame where a
+whole frame is expensive.
 
 Every RTL build also compiles the `WW_ASSERT` block at the bottom of the RTL:
 six elaboration-time parameter checks and eight per-cycle invariants on the
 hold counter, the requantise sign, the FSM and the outputs, for ~0.5 s. Because
-they hold under every stimulus, all twelve tests are scenarios for them.
+they hold under every stimulus, all fourteen tests are scenarios for them.
 `src/config.json` never defines `WW_ASSERT`, and that the block does not reach
 synthesis is verified rather than argued -- re-running the flow with it present
 produced a byte-identical netlist.
 
 ```bash
-./scripts/assert_mutations.sh   # reintroduce 9 real bugs; each must be caught (~45 s)
+./scripts/assert_mutations.sh   # reintroduce 12 real bugs; each must be caught
 ./scripts/coverage.sh           # verilator line/branch/expr/toggle coverage, raw and waived
 ```
 
 The mutation test is what makes those assertions evidence rather than
 decoration -- an assertion that has never failed may be a tautology, and it has
-already caught one of mine that permitted a permanently lit LED. Two of the
-nine mutations make the design read `uio_in` and gate on `ena`, and the
-unused-pins test has to fail on each.
+already caught one of mine that permitted a permanently lit LED. Two mutations
+make the design read `uio_in` and gate on `ena`; three more disable the real fire
+path, break a detection mirror, and make the threshold comparison inclusive.
+The named tests must fail.
 
 Coverage prints two figures. Raw, the RTL sits at 85.7% line, 88.2% branch,
 85.5% expression and 92.4% toggle. After `test/coverage_waivers.txt` -- one
 line per point that cannot be reached at the shipped parameters and weights,
 each with its proof, and the script fails if a proof goes stale -- it is 100%
-on all four. Three of the twelve tests exist because that measurement found a
+on all four. Three of the fourteen tests exist because that measurement found a
 gap. See [docs/coverage.md](docs/coverage.md).
 
 GitHub Actions also runs TinyTapeout precheck, GDS generation, and gate-level

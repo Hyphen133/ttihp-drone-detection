@@ -33,8 +33,34 @@ jobs:
           cd test
           make clean
           FRAME_LOG2=${{ matrix.frame_log2 }} make
-          # make will return success even if the test fails, so check for failure in the results.xml
-          ! grep failure results.xml
+          # cocotb 1.x can let make return success after a failed testcase. Parse
+          # JUnit structurally, and name the new regression tests explicitly so a
+          # decorator or discovery regression cannot silently skip them in CI.
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          required = {
+              "test_debug_pin_mapping",
+              "test_real_fire_drives_detection_outputs",
+          }
+          root = ET.parse("results.xml").getroot()
+          cases = {case.attrib["name"]: case for case in root.iter("testcase")}
+          missing = required - cases.keys()
+          failed = {
+              name for name, case in cases.items()
+              if any(case.find(tag) is not None for tag in ("failure", "error"))
+          }
+          skipped_required = {
+              name for name in required & cases.keys()
+              if cases[name].find("skipped") is not None
+          }
+          if missing or failed or skipped_required:
+              raise SystemExit(
+                  f"missing: {sorted(missing)}; failed/error: {sorted(failed)}; "
+                  f"required but skipped: {sorted(skipped_required)}"
+              )
+          print(f"verified required tests passed; JUnit contains {len(cases)} testcases")
+          PY
 
       - name: Test Summary
         uses: test-summary/action@v2.4

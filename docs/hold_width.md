@@ -86,11 +86,12 @@ run so few. The gate-level pass -- the one run against the netlist that
 actually tapes out -- compares a permanently-low LED against a permanently-low
 model and agrees no matter what the output stage does.
 
-There is a second instance of the same trap in this repo, and it was here
-before any of this work: `test_detector_matches_model` runs at `trim = 62`,
-where this stimulus fires **zero** windows. Its LED comparison was vacuous, so
-until `test_hold_duration` and `test_trim_raises_threshold` were added, nothing
-in this repository could observe a detection at all.
+`test_detector_matches_model` runs at `trim = 58`, where this deterministic
+stimulus lands exactly on the threshold. That checks that equality does not
+fire and that classifier arithmetic does not invent a detection. A separate
+`test_real_fire_drives_detection_outputs` uses a threshold below the output
+layer's mathematical minimum, reaches a real staggered-window decision without
+forcing DUT state, and checks assertion and release on every detection pin.
 
 ## What holds it now
 

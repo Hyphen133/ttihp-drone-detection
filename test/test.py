@@ -13,7 +13,7 @@ import re
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge
+from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 import numpy as np  # noqa: E402
 import drone_model  # noqa: E402
@@ -21,6 +21,7 @@ import drone_model  # noqa: E402
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 FRAME_LOG2 = int(os.environ.get("FRAME_LOG2", "8"))
 NHID, HACC_W, HSHIFT, FEAT_OFF = 4, 6, 1, 6
+OSUM_W = (NHID * 15).bit_length() + 1
 NPHASE = 2
 GATES = os.environ.get("GATES", "") == "yes"
 # 40 frames at FRAME_LOG2=8 is 13 M clocks (~20 s). At the tape-out frame
@@ -178,6 +179,12 @@ def led(dut):
     return (int(dut.uo_out.value) >> 3) & 1
 
 
+def signed(value, width):
+    """Interpret an unsigned simulator value as a width-bit two's complement."""
+    value = int(value)
+    return value - (1 << width) if value & (1 << (width - 1)) else value
+
+
 async def capture_frames(dut, b, bits, n_frames):
     """Per-frame band maxima, sampled on the RTL's own frame boundary.
 
@@ -255,7 +262,11 @@ async def test_detector_matches_model(dut):
     await b.reset()
 
     W1, HB, W2, thr = load_weights()
-    trim = 62  # effective threshold 6: the useful high-recall operating point
+    # This deterministic stream reaches score -10. trim=58 makes the effective
+    # threshold exactly -10, so the run checks that the RTL's comparison is
+    # strict (score == threshold must not fire), not merely that both sides stay
+    # low far away from the decision boundary.
+    trim = 58
     det = drone_model.Detector(W1, HB, W2, thr + ((trim - 64) << 2), cfg,
                         hacc_w=HACC_W, hshift=HSHIFT, feat_off=FEAT_OFF,
                         refractory_frames=HOLD_FRAMES)
@@ -265,13 +276,25 @@ async def test_detector_matches_model(dut):
     golden = golden_frames(bits, cfg, NFRAMES_RUN)
 
     mism, frames, prev_st, pending = 0, 0, 0, False
+    pending_score = None
+    saw_equal_threshold = False
     for tick_i in range(n_ticks):
         b.set_bit(bits[tick_i], trim)
         for _ in range(PDM_DIV):
             await RisingEdge(dut.clk)
             st = read_state(dut)
             if st == S_CLASS and prev_st != S_CLASS and frames < len(golden):
+                model_frame = det.frame
                 det.push_frame(golden[frames])
+                closing = []
+                for phase in range(cfg.nphase):
+                    slot = (model_frame - phase * (cfg.nframe // cfg.nphase)) % cfg.nframe
+                    if slot == cfg.nframe - 1:
+                        hval = np.clip(det.acc[phase] >> HSHIFT, 0, 15)
+                        hval[det.acc[phase] < 0] = 0
+                        closing.append(int((hval * W2).sum()))
+                assert len(closing) <= 1, "more than one staggered phase closed in one frame"
+                pending_score = closing[0] if closing else None
                 frames += 1
                 pending = True
             elif pending and st == 0:
@@ -281,9 +304,26 @@ async def test_detector_matches_model(dut):
                     mism += 1
                     if mism <= 3:
                         dut._log.error(f"frame {frames}: LED rtl={rtl} model={exp}")
+                if not GATES:
+                    rtl_acc = np.array([
+                        [signed(dut.user_project.hacc[p * NHID + h].value, HACC_W)
+                         for h in range(NHID)]
+                        for p in range(cfg.nphase)
+                    ])
+                    assert np.array_equal(rtl_acc, det.acc), \
+                        f"frame {frames}: hacc RTL={rtl_acc.tolist()} model={det.acc.tolist()}"
+                    if pending_score is not None:
+                        rtl_score = signed(dut.user_project.osum.value, OSUM_W)
+                        assert rtl_score == pending_score, \
+                            f"frame {frames}: output sum RTL={rtl_score} model={pending_score}"
+                        saw_equal_threshold |= pending_score == det.thresh
                 pending = False
             prev_st = st
+    assert frames >= min(4, NFRAMES_RUN), f"only classified {frames} frames"
     assert mism == 0, f"{mism}/{frames} frames disagreed on the LED"
+    if not FAST_ONLY:
+        assert saw_equal_threshold, \
+            "stimulus no longer lands exactly on the threshold; strict-compare check is vacuous"
     dut._log.info(f"{frames} frames: LED matches the model, "
                   f"{len(det.fired)} window(s) fired")
 
@@ -319,15 +359,98 @@ async def test_mic_clock_period(dut):
     dut._log.info(f"mic period {PDM_DIV} clk = {drone_model.PDM_HZ/1000:.1f} kHz; "
                   f"tape-out frame {TAPEOUT_FRAME_MS:.2f} ms")
 
+
+@cocotb.test(skip=GATES)
+async def test_debug_pin_mapping(dut):
+    """Every documented output bit is driven by the intended internal signal.
+
+    The end-to-end tests primarily read uo[0], uo[1], and (at gate level) the
+    FSM/debug band. A swapped mirror, frame-index bit, or tick debug bit could
+    therefore leave all numerical comparisons green. Stop the clock and
+    deposit two distinct legal snapshots so every field has a non-zero oracle.
+    """
+    clock_task = cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
+    cfg = test_cfg()
+    b = Bench(dut, cfg)
+    await b.reset()
+    clock_task.kill()
+
+    async def check_snapshot(div, hold, fmax0, state, frame):
+        dut.user_project.div.value = div
+        dut.user_project.hold.value = hold
+        dut.user_project.fmax[0].value = fmax0
+        dut.user_project.st.value = state
+        dut.user_project.cnt.value = frame << cfg.frame_log2
+        await Timer(1, units="ns")
+
+        mic_clock = (div >> (cfg.pdm_div.bit_length() - 2)) & 1
+        tick = int(div == 1)
+        detect = int(hold != 0)
+        exp_uo = mic_clock | (0b1110 if detect else 0) | ((fmax0 & 0xF) << 4)
+        exp_uio = (frame & 0xF) | (detect << 4) | ((state & 0x3) << 5) | (tick << 7)
+        assert int(dut.uo_out.value) == exp_uo, \
+            f"uo_out={int(dut.uo_out.value):02x}, expected {exp_uo:02x}"
+        assert int(dut.uio_out.value) == exp_uio, \
+            f"uio_out={int(dut.uio_out.value):02x}, expected {exp_uio:02x}"
+        assert int(dut.uio_oe.value) == 0xFF, "debug build must drive every uio pin"
+
+    await check_snapshot(div=1, hold=HOLD_FRAMES, fmax0=0xD, state=2, frame=0xA)
+    await check_snapshot(div=PDM_DIV // 2, hold=0, fmax0=0x3, state=3, frame=0x5)
+
+
+@cocotb.test(skip=GATES)
+async def test_real_fire_drives_detection_outputs(dut):
+    """A real classifier decision must assert and then release every detect pin.
+
+    This deliberately uses the minimum trim. Its threshold is below the output
+    layer's mathematical minimum (-NHID*15), so the first staggered window must
+    fire regardless of the microphone sequence. Unlike the hold duration test,
+    nothing inside the DUT is forced.
+    """
+    cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
+    cfg = test_cfg()
+    b = Bench(dut, cfg)
+    await b.reset()
+
+    trim = 0
+    _, _, _, trained_threshold = load_weights()
+    effective_threshold = trained_threshold + ((trim - 64) << 2)
+    assert effective_threshold < -(NHID * 15), \
+        "minimum trim no longer guarantees a fire; give this test a deterministic oracle"
+
+    # Phase 1 closes at frame NFRAME/NPHASE-1. One further frame lets the real
+    # S_ROLL decrement release HOLD_FRAMES=2 without another window closing.
+    n_frames = cfg.nframe // cfg.nphase + HOLD_FRAMES
+    n_ticks = n_frames << cfg.frame_log2
+    saw_high = False
+    saw_release = False
+    for tick_i in range(n_ticks):
+        b.set_bit(tick_i & 1, trim)
+        for _ in range(PDM_DIV):
+            await RisingEdge(dut.clk)
+            uo = int(dut.uo_out.value)
+            mirrored = (uo >> 1) & 0b111
+            debug_detect = (int(dut.uio_out.value) >> 4) & 1
+            assert mirrored in (0, 0b111), f"detection mirrors disagree: {mirrored:03b}"
+            assert debug_detect == int(mirrored != 0), "uio detection debug disagrees with uo"
+            if mirrored:
+                saw_high = True
+            elif saw_high:
+                saw_release = True
+
+    assert saw_high, "guaranteed-low threshold never produced a real classifier fire"
+    assert saw_release, "detection outputs did not release after the configured hold"
+
 @cocotb.test(skip=FAST_ONLY)
 async def test_hold_duration(dut):
     """The LED stays up for exactly HOLD_FRAMES-1 frames after a fire.
 
-    This is the only check on how long the output lasts. The equivalence tests
-    cannot cover it: a fire needs a full NFRAME window, which none of the short
-    runs reach, so they all compare a permanently-low LED. `hold` is therefore
-    loaded here exactly as the S_CLASS fire path loads it, on a real frame
-    boundary, and the release is counted in the design's own frames.
+    This is the exact frame-count check on how long the output lasts. The
+    detector equivalence run deliberately lands on (not above) its threshold,
+    while test_real_fire_drives_detection_outputs checks assertion and release
+    without counting the duration. `hold` is therefore loaded here exactly as
+    the S_CLASS fire path loads it, on a real frame boundary, and the release is
+    counted in the design's own frames.
     """
     cocotb.start_soon(Clock(dut.clk, 20, units="ns").start())
     cfg = test_cfg()

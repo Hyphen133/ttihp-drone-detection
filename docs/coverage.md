@@ -84,7 +84,7 @@ in the count.
 
 ## What the measurement actually changed
 
-Three of the twelve tests came out of this rather than out of guesswork:
+Three of the fourteen tests came out of this rather than out of guesswork:
 
 * **`test_unused_inputs_ignored`.** The one real gap. The TinyTapeout wrapper
   wires all eight `uio` pins and `ena` into every project, this design uses
@@ -123,8 +123,9 @@ the unused pins were test gaps.
 
 Coverage says the logic ran. It says nothing about whether anything would have
 noticed a wrong answer. `scripts/assert_mutations.sh` is the other half: it
-reintroduces nine real bugs -- seven against the named assertion, two against
-the unused-pins test -- and requires each to be caught. It has already earned
+reintroduces twelve real bugs -- seven against the named assertion and five
+against focused behavioural tests -- and requires each to be caught. It has
+already earned
 its place by finding that `A_HOLD_STEP` permitted a hold counter stuck on
 forever -- 100 % line coverage over that code would not have hinted at it. See
 [hold_width.md](hold_width.md).
