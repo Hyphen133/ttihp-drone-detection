@@ -166,22 +166,25 @@ module tt_um_hyphen133_drone_detection #(
   // Every mic tick rotates all NSTAGE words past a single compute slot, so the
   // NSTAGE:1 read mux and the 1:NSTAGE write demux both disappear; the price
   // is that the cascade always takes NSTAGE clocks instead of only the due ones.
-  logic signed [STATE_W-1:0] ring [NSTAGE];
+  // These arrays are register banks by design. The annotation asks Yosys to do
+  // its required early memory-to-register lowering explicitly and silently;
+  // without it, the async reset below triggers four misleading warnings.
+  (* mem2reg *) logic signed [STATE_W-1:0] ring [NSTAGE];
   // Per-band frame maxima, also a ROTATING ring: the tap stages visit the
   // bands in order 0..NBAND-1 on every tick, so the band being updated is
   // always fmax[0] and the new value goes to the tail; after the NBAND tap
   // steps the ring is back in band order for the classifier's parallel read.
-  logic        [FEAT_W-1:0]  fmax  [NBAND];
+  (* mem2reg *) logic        [FEAT_W-1:0]  fmax  [NBAND];
   // Per-band frame-mean accumulator, rotated in lockstep with fmax so the band
   // under update is always at the head, and cleared with it at the frame
   // boundary. It holds the sum of 2^AVG_SHIFT samples, so the mean is the top
   // FEAT_W bits.
-  logic        [AVG_W-1:0]   favg  [NAVG];
+  (* mem2reg *) logic        [AVG_W-1:0]   favg  [NAVG];
   // Hidden accumulators, one per (phase, unit), also kept as a ROTATING ring:
   // S_CLASS visits the NSLOT slots in a fixed order every frame, so the
   // current slot's accumulator is always hacc[0] and the result goes to the
   // tail. No NSLOT:1 read mux, no 1:NSLOT write demux.
-  logic signed [HACC_W-1:0]  hacc  [NSLOT];
+  (* mem2reg *) logic signed [HACC_W-1:0]  hacc  [NSLOT];
   // Output-layer sum: NHID terms of at most 15 each, so it needs only
   // OSUM_W bits; the compare against the SCORE_W-bit threshold sign-extends.
   localparam OSUM_W = $clog2(NHID * 15 + 1) + 1;
