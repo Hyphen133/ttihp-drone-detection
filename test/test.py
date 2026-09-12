@@ -9,7 +9,6 @@ a real equivalence check rather than a smoke test.
 """
 
 import os
-import re
 
 import cocotb
 from cocotb.clock import Clock
@@ -17,10 +16,16 @@ from cocotb.triggers import ClockCycles, RisingEdge, Timer
 
 import numpy as np  # noqa: E402
 import drone_model  # noqa: E402
+import drone_weights_io  # noqa: E402
 
 SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 FRAME_LOG2 = int(os.environ.get("FRAME_LOG2", "8"))
-NHID, HACC_W, HSHIFT, FEAT_OFF = 4, 6, 1, 6
+# Single-sourced in drone_weights_io so the live-microphone harness in ui/ cannot
+# drift from the values this suite checks the RTL against.
+NHID = drone_weights_io.NHID
+HACC_W = drone_weights_io.HACC_W
+HSHIFT = drone_weights_io.HSHIFT
+FEAT_OFF = drone_weights_io.FEAT_OFF
 OSUM_W = (NHID * 15).bit_length() + 1
 NPHASE = 2
 GATES = os.environ.get("GATES", "") == "yes"
@@ -33,10 +38,10 @@ NFRAMES_RUN = int(os.environ.get("NFRAMES",
 # test_hold_duration asserts the RTL agrees, so a change there fails here
 # instead of silently desyncing the golden Detector, whose refractory_frames is
 # this same number.
-HOLD_FRAMES = 2
+HOLD_FRAMES = drone_weights_io.HOLD_FRAMES
 # `hold` is loaded in S_CLASS and decremented in the S_ROLL of that same frame,
 # so the LED covers HOLD_FRAMES-1 whole frames.
-HOLD_FRAMES_VISIBLE = HOLD_FRAMES - 1
+HOLD_FRAMES_VISIBLE = drone_weights_io.HOLD_FRAMES_VISIBLE
 # Frame period of the build that tapes out, independent of the shortened
 # FRAME_LOG2 the fast run uses.
 TAPEOUT_FRAME_MS = (1 << 16) / (drone_model.PDM_HZ / 1000.0)
@@ -59,37 +64,14 @@ def test_cfg():
 # ---------------------------------------------------------------------------
 # Parse the generated weight header so RTL and model share one source of truth
 # ---------------------------------------------------------------------------
+# The parser itself lives in drone_weights_io so that consumers without cocotb
+# installed -- ui/, the live-microphone harness -- read the same header through
+# the same code rather than through a second copy of it.
 def load_weights():
     """Parse the generated header so RTL and model share one source of truth."""
-    hdr = "drone_weights.svh"
-    with open(os.path.join(SRC, hdr)) as f:
-        txt = f.read()
-    def const(name):
-        m = re.search(name + r"\s*=\s*(\d+)'h([0-9a-fA-F]+)", txt)
-        return int(m.group(2), 16), int(m.group(1))
     cfg = test_cfg()
-    H, NF, NB = NHID, cfg.nframe, cfg.nband
-    v, _ = const("WW_ROW")
-    W1 = np.zeros((H, NF, NB), dtype=np.int64)
-    for h in range(H):
-        for f in range(NF):
-            row = (v >> (2 * NB * (h * NF + f))) & ((1 << (2 * NB)) - 1)
-            for b in range(NB):
-                c = (row >> (2 * b)) & 0b11
-                W1[h, f, b] = 1 if c == 0b01 else (-1 if c == 0b11 else 0)
-    hv, _ = const("WW_HBIAS")
-    HB = []
-    for h in range(H):
-        u = (hv >> (HACC_W * h)) & ((1 << HACC_W) - 1)
-        HB.append(u - (1 << HACC_W) if u >> (HACC_W - 1) else u)
-    wv, _ = const("WW_W2")
-    W2 = []
-    for h in range(H):
-        c = (wv >> (2 * h)) & 0b11
-        W2.append(1 if c == 0b01 else (-1 if c == 0b11 else 0))
-    tv, tw = const("WW_THRESH_PK")
-    thr = tv - (1 << tw) if tv >> (tw - 1) else tv
-    return W1, np.array(HB), np.array(W2), thr
+    return drone_weights_io.load_weights(SRC, nhid=NHID, nframe=cfg.nframe,
+                                         nband=cfg.nband, hacc_w=HACC_W)
 
 
 # ---------------------------------------------------------------------------

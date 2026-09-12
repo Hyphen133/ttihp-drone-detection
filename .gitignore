@@ -12,6 +12,11 @@ results.xml
 *.fst.hier
 test/gate_level_netlist.v
 
+# Live-microphone UI
+ui/recordings/
+.playwright-mcp/
+.pytest_cache/
+
 # TinyTapeout / LibreLane generated outputs
 runs/
 tt_submission/
