@@ -692,8 +692,9 @@ async def test_trim_raises_threshold(dut):
     if GATES:
         b = Bench(dut, cfg)
         await b.reset()
+        # Same trim pair as gate_threshold_campaign: 58 fires, 59 does not.
         fires = await gate_threshold_campaign(dut, b, cfg)
-        assert fires[56] > fires[57], f"raising trim did not suppress detection: {fires}"
+        assert fires[58] > fires[59], f"raising trim did not suppress detection: {fires}"
         return
 
     n_frames = min(NFRAMES_RUN, 24)
