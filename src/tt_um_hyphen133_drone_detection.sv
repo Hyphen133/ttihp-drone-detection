@@ -27,8 +27,9 @@
 //      41.9 ms rather than latching: at the old 16 the LED lagged the
 //      aircraft by 629 ms and ran two passes together into one.
 //
-// The fixed drone_2 template weights come from drone_weights.svh. Ternary
-// weights cost nothing here: a zero drops that term from the adder tree.
+// The fixed template weights come from drone_weights.svh (drone_dads_lvl12_s4:
+// trained across a -12..0 dB level span, 98.98 % test AUC). Ternary weights
+// cost nothing here: a zero drops that term from the adder tree.
 
 `default_nettype none
 
@@ -37,7 +38,7 @@ module tt_um_hyphen133_drone_detection #(
     parameter NSTAGE       = 9,    // cascade depth
     parameter K_SHIFT      = 2,     // 1-pole coefficient
     parameter STATE_W      = 10,    // signed cascade state
-    // drone_2 geometry: five octave bands and a 671 ms integration window.
+    // drone_2/drone_4 geometry: five octave bands and a 671 ms integration window.
     // This exact configuration completed the IHP sg13g2 1x1 flow at 94.60%
     // final core utilization with clean DRC, LVS, antenna, and timing checks.
     parameter TAP0         = 4,     // stages 3..8, keeping the lowest band
@@ -76,10 +77,17 @@ module tt_um_hyphen133_drone_detection #(
     parameter NPHASE       = 2,     // staggered windows, hop = NFRAME/NPHASE
     parameter NHID         = 4,     // hidden units; 1 == the old linear template
     parameter HACC_W       = 6,     // saturating hidden accumulator
-    parameter HSHIFT       = 1,
-    parameter FEAT_OFF     = 6,     // constant subtracted from each band
+    parameter HSHIFT       = 1,     // hidden requantise: clamp(acc>>HSHIFT,0,15)
+    parameter FEAT_OFF     = 8,     // constant subtracted from each band
                                     // feature before the adder tree; keeps
-                                    // the accumulator and bias small     // hidden requantise: clamp(acc>>HSHIFT,0,15)
+                                    // the accumulator and bias small. MUST
+                                    // equal the header's centre (WW_CENTRE):
+                                    // the trainer centred the features on
+                                    // this value, and a mismatch runs a
+                                    // different model from the one measured
+                                    // (drone_4: FEAT_OFF 6 vs centre 8 turned
+                                    // 98.9 % AUC into 81 %). Checked by
+                                    // A_CENTRE below.
     parameter SCORE_W      = 10,
     // LED hold. `hold` is loaded in S_CLASS and decremented in the S_ROLL of
     // that same frame, so the LED stays up for HOLD_FRAMES-1 whole frames:
@@ -99,7 +107,7 @@ module tt_um_hyphen133_drone_detection #(
     input  wire       rst_n
 );
 
-  // Fixed drone_2 weights. Keeping one header makes the submitted build
+  // Fixed weights. Keeping one header makes the submitted build
   // independent of command-line defines used by the original multi-model repo.
   `include "drone_weights.svh"
 
@@ -295,9 +303,20 @@ module tt_um_hyphen133_drone_detection #(
   // mis-decode every weight. A mean is read as
   // the top FEAT_W bits of its accumulator, which is the divide by
   // 2^AVG_SHIFT.
-  logic signed [HACC_W-1:0] dot;
+  //
+  // The dot product is exact; only the accumulator saturates. That is the
+  // arithmetic the trainer, eval_header.py and the golden model all use, so
+  // the dot needs its own width: NFEAT centred features of up to 2^FEAT_W-1
+  // each. At HACC_W=6 the five-band sum reaches +-40, and an earlier build
+  // that held it in HACC_W bits wrapped it -- silence (every feature 0,
+  // centred to -8) through a row of five -1 weights gave -24 instead of +40,
+  // so the silicon ran a different model from the measured one whenever
+  // |dot| > 31. test_detector_matches_model caught it on the lvl12 weights.
+  localparam DOT_W = FEAT_W + $clog2(NFEAT + 1) + 1;
+  localparam ACW_W = (DOT_W > HACC_W ? DOT_W : HACC_W) + 1;
+  logic signed [DOT_W-1:0] dot;
   always_comb begin
-    logic signed [HACC_W-1:0] fc;
+    logic signed [DOT_W-1:0] fc;
     logic        [FEAT_W-1:0] fv;
     dot = '0;
     for (int b = 0; b < NFEAT; b++) begin
@@ -305,7 +324,7 @@ module tt_um_hyphen133_drone_detection #(
       w2 = wrow[2*b +: 2];
       fv = (b < NBAND) ? fmax[b]
                        : FEAT_W'(favg[b - NBAND][AVG_W-1 -: FEAT_W]);
-      fc = HACC_W'($signed({1'b0, fv})) - HACC_W'(FEAT_OFF);
+      fc = DOT_W'($signed({1'b0, fv})) - DOT_W'(FEAT_OFF);
       if (w2[0]) dot = w2[1] ? dot - fc : dot + fc;
     end
   end
@@ -315,9 +334,13 @@ module tt_um_hyphen133_drone_detection #(
   // so centring costs nothing in silicon.
   wire signed [HACC_W-1:0] hb = $signed(WW_HBIAS[HACC_W*c_hd +: HACC_W]);
   wire signed [HACC_W-1:0] acc_cur = (c_slot == '0) ? hb : hacc[0];
-  wire signed [HACC_W:0]   acc_wide = {acc_cur[HACC_W-1], acc_cur} + {dot[HACC_W-1], dot};
-  localparam signed [HACC_W:0] HA_MAX =  (1 << (HACC_W-1)) - 1;
-  localparam signed [HACC_W:0] HA_MIN = -(1 << (HACC_W-1));
+  // Sign-extend both operands to ACW_W bits so acc_cur + dot cannot wrap
+  // before the saturation compare below.
+  wire signed [ACW_W-1:0]  acc_wide =
+      $signed({{(ACW_W-HACC_W){acc_cur[HACC_W-1]}}, acc_cur}) +
+      $signed({{(ACW_W-DOT_W){dot[DOT_W-1]}}, dot});
+  localparam signed [ACW_W-1:0] HA_MAX =  (1 << (HACC_W-1)) - 1;
+  localparam signed [ACW_W-1:0] HA_MIN = -(1 << (HACC_W-1));
   wire signed [HACC_W-1:0] acc_next =
       (acc_wide >  HA_MAX) ? HACC_W'(HA_MAX) :
       (acc_wide <  HA_MIN) ? HACC_W'(HA_MIN) : HACC_W'(acc_wide);
@@ -510,6 +533,11 @@ module tt_um_hyphen133_drone_detection #(
     assert (FEAT_OFF < (1 << FEAT_W))
       else $fatal(1, "A_FEAT_OFF: FEAT_OFF=%0d exceeds the feature range",
                   FEAT_OFF);
+    // A_CENTRE. The header was trained with its features centred on WW_CENTRE;
+    // the silicon subtracts FEAT_OFF. Unequal means a different model ships.
+    assert (FEAT_OFF == WW_CENTRE)
+      else $fatal(1, "A_CENTRE: FEAT_OFF=%0d but the weight header was trained at centre=%0d",
+                  FEAT_OFF, WW_CENTRE);
   end
 
   logic fire_q;

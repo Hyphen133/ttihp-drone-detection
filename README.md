@@ -8,18 +8,62 @@ integer signal-processing pipeline and ternary neural-network weights are
 hard-wired, so the chip needs no host, memory, firmware, or model upload.
 
 ```text
- PDM data ──ui[0]──► octave filterbank ─► log levels ─► drone_4 NN ─► uo[3:1]
+ PDM data ──ui[0]──► octave filterbank ─► log levels ─► ternary NN ─► uo[3:1]
  mic clock ◄─uo[0]──       5 bands          16 frames
  trim ───ui[7:1]──────────────────────────► threshold
 ```
 
-## Drone_4 result
+## Current build: `drone_dads_lvl12_s4` weights
 
-The checked-in RTL and weights are the `drone_4` build: the same trained model
-as `drone_2` -- bit-exact test AUC **98.92%** on Drone Audio Detection Samples
-(DADS) -- with a re-tuned clock tree and a shorter output hold. The weights are
-untouched, so the accuracy figure carries over rather than being re-measured.
-The reference IHP sg13g2 hardening completed in a 1×1 tile with:
+The checked-in weights are `drone_dads_lvl12_s4`, trained in
+`tinytapeout-mnist-nn-asic` on DADS with every clip re-levelled across a
+−12…0 dB span (a mixture of loudness, so the template does not key on one
+recording level). Twelve seeds were trained; seed 4 was selected on validation
+AUC alone, and the test split was never used to choose. Scored with the
+bit-exact chip model (`eval_header.py --tag dads_lvl12 --feat-off 8`):
+
+| split | clips | AUC |
+|---|---:|---:|
+| validation | 11 051 | 99.15 % |
+| test (held out) | 12 117 | **98.98 %** |
+
+Three things changed with the weights, and the first two are fixes to the
+`drone_4` build that shipped before:
+
+- **`FEAT_OFF` now equals the header's centre (8).** The trainer centres the
+  4-bit band features on the training-set mean and writes it as `centre=N`;
+  the RTL subtracts `FEAT_OFF`. `drone_4` hardened `FEAT_OFF=6` against a
+  `centre=8` header, which is a different model from the measured one (98.9 %
+  AUC on paper, 81 % in silicon). The header now also carries
+  `localparam WW_CENTRE`, the RTL asserts `FEAT_OFF == WW_CENTRE` at
+  elaboration (`A_CENTRE`), and `test/drone_weights_io.py` reads the centre
+  from the header so the golden model cannot drift either.
+- **The classifier dot product no longer wraps.** It was held in `HACC_W` (6)
+  bits, but five centred features of up to ±8 sum to ±40. The trainer, the
+  scorer and the golden model all compute the dot exactly and saturate only
+  the accumulator, so the silicon disagreed with them whenever |dot| > 31 --
+  silence through a five-weight row, for one. `test_detector_matches_model`
+  caught it on the new weights at frame 6; the dot now has its own width.
+- **The shipped threshold is the validation max-accuracy point, 5**, so trim
+  64 is the useful default. The trainer's threshold of 14 fired on 14 % of
+  test drones.
+
+This build hardens clean in the 1×1 tile with the same LibreLane 3.0.6 flow
+(`TAG=lvl12 ./scripts/harden_local.sh`, `runs/lvl12/final/metrics.json`):
+
+| metric | value |
+|---|---:|
+| final core utilisation | 93.78 % |
+| instances | 2 165 (280 hold buffers) |
+| max-fanout, max-cap, max-slew violations | 0 |
+| routing DRC, Magic DRC, KLayout DRC | 0 |
+| LVS errors, antenna violations | 0 |
+| setup / hold violations, all three corners | 0 |
+| worst setup slack | +8.30 ns (slow corner) |
+| worst hold slack | +0.137 ns (fast corner) |
+
+The previous `drone_4` reference hardening of the same logic completed in a
+1×1 tile with:
 
 - 94.21% final core utilization and 2,122 instances;
 - **zero max-fanout violations** (14 in `drone_2`);
@@ -54,10 +98,21 @@ sound may confuse an acoustic detector.
 - `uo[7:4]`: live four-bit band-level debug value.
 - `uio[7:0]`: output-only frame, detection, FSM, and microphone-tick debug.
 
-The learned threshold is 14 at trim 64. Each trim step changes it by four:
-trim 63 gives threshold 10, while trim 62 gives threshold 6. On the held-out
-dataset, threshold 10 gave 65.8% recall at 0.7% negative clips firing;
-threshold 6 gave 95.2% recall at 4.1% negative clips firing.
+The shipped threshold is 5 at trim 64, the point that maximises accuracy on
+the validation split. Each trim step changes it by four. On the held-out test
+split, with the bit-exact chip model:
+
+| trim | threshold | accuracy | recall | negative clips firing |
+|---:|---:|---:|---:|---:|
+| 66 | 13 | 65.8 % | 26.3 % | 0.25 % |
+| 65 | 9 | 87.8 % | 74.8 % | 1.07 % |
+| **64** | **5** | **96.0 %** | **96.6 %** | **4.42 %** |
+| 63 | 1 | 92.4 % | 99.7 % | 13.9 % |
+| 62 | −3 | 78.0 % | 100 % | 40.8 % |
+
+Synthetic room tone never fires at the shipped threshold. Raise the trim for
+fewer false alarms, lower it for recall; these are clip-level dataset figures,
+not alarms per hour in a deployment.
 
 ## Verification
 
@@ -91,7 +146,8 @@ behaviours execute on the netlist; the separate 100% waived coverage figure is
 an RTL logic-coverage measurement, not a standard-cell-netlist toggle claim.
 
 Every RTL build also compiles the `WW_ASSERT` block at the bottom of the RTL:
-six elaboration-time parameter checks and eight per-cycle invariants on the
+seven elaboration-time parameter checks (including `A_CENTRE`, header centre
+against `FEAT_OFF`) and eight per-cycle invariants on the
 hold counter, the requantise sign, the FSM and the outputs, for ~0.5 s. Because
 they hold under every stimulus, all fourteen tests are scenarios for them.
 `src/config.json` never defines `WW_ASSERT`, and that the block does not reach
@@ -101,7 +157,14 @@ produced a byte-identical netlist.
 ```bash
 ./scripts/assert_mutations.sh   # reintroduce 12 real bugs; each must be caught
 ./scripts/coverage.sh           # verilator line/branch/expr/toggle coverage, raw and waived
+TAG=lvl12 ./scripts/harden_local.sh   # the tt-gds-action LibreLane flow, locally (~1 h)
 ```
+
+`harden_local.sh` writes `runs/$TAG/`; copy the unpowered
+`runs/$TAG/final/nl/tt_um_hyphen133_drone_detection.nl.v` to
+`test/gate_level_netlist.v` and run `GATES=yes make` for the gate-level suite
+(with a stock iverilog, pass `GL_CELLS=` a copy of `sg13g2_stdcell.v` with the
+`specify` blocks stripped).
 
 The mutation test is what makes those assertions evidence rather than
 decoration -- an assertion that has never failed may be a tautology, and it has

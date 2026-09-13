@@ -24,10 +24,17 @@ The multiplier-free integer pipeline is:
    latching. An earlier build held for 629 ms, which lagged the aircraft
    and ran two passes together into one.
 
-The `drone_2` weights reached 98.92% test AUC on the DADS evaluation split.
-Reference hardening of the same logic completed in one IHP sg13g2 1×1 tile at
-94.60% final core utilization with clean DRC, LVS, antenna, setup, and hold
-checks.
+The shipped `drone_dads_lvl12_s4` weights were trained on DADS with every clip
+re-levelled across a −12…0 dB span, so the template is not tied to one
+recording level. Scored with the bit-exact chip model they reach 99.15 % AUC on
+the validation split and 98.98 % on the held-out test split; the seed was chosen
+on validation only. The RTL subtracts the header's own feature centre
+(`FEAT_OFF = WW_CENTRE = 8`) and asserts the equality at elaboration, and the
+classifier dot product is computed exactly before the six-bit saturation --
+both are fixes to the earlier `drone_4` build, which ran a different model from
+the one it was measured on. Hardening of this build completed in one IHP
+sg13g2 1×1 tile at 93.78% final core utilization with zero DRC, LVS, antenna,
+max-fanout, setup and hold violations at all three corners.
 
 ![Reference drone_4 layout](drone_4_layout.png)
 
@@ -36,17 +43,20 @@ checks.
 1. Connect a compatible PDM microphone's data pin to `ui[0]` and clock pin to
    `uo[0]`, together with the appropriate board power and ground.
 2. Apply the specified 50 MHz system clock and release reset.
-3. Start with threshold trim `ui[7:1] = 7'd63`, which produces an effective
-   threshold of 10. Detection appears on `uo[3:1]`.
-4. For higher recall, use trim 62 (effective threshold 6). For fewer false
-   triggers, increase the trim toward or above the neutral value 64.
+3. Start with the neutral threshold trim `ui[7:1] = 7'd64`, which gives the
+   shipped threshold of 5, the validation max-accuracy point. Detection
+   appears on `uo[3:1]`.
+4. For fewer false triggers, use trim 65 (threshold 9). For higher recall, use
+   trim 63 (threshold 1).
 5. Check `uo[7:4]` for a changing band-level value to confirm that microphone
    data is reaching the front end.
 
-Each trim increment changes the decision threshold by four score units. Dataset
-operating points were 65.8% recall / 0.7% negative clips firing at threshold 10
-and 95.2% / 4.1% at threshold 6. These clip-level figures do not predict alarms
-per hour in a real deployment.
+Each trim increment changes the decision threshold by four score units. On the
+held-out test split the operating points were 96.6% recall / 4.4% negative clips
+firing at threshold 5 (trim 64), 74.8% / 1.1% at threshold 9 (trim 65) and
+99.7% / 13.9% at threshold 1 (trim 63). Synthetic room tone never fires at
+threshold 5. These clip-level figures do not predict alarms per hour in a real
+deployment.
 
 ## External hardware
 

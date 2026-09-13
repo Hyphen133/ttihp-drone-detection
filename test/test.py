@@ -255,7 +255,11 @@ async def gate_threshold_campaign(dut, b, cfg):
     n_frames = cfg.nframe // cfg.nphase
     bits = [i & 1 for i in range(n_frames << cfg.frame_log2)]
     fired = {}
-    for trim in (56, 57):
+    # Adjacent trims straddling the -15 the alternating stream scores on the
+    # drone_dads_lvl12_s4 weights at the shipped threshold 5: 58 gives -19 and
+    # fires, 59 gives exactly -15 and must not (strict compare). Re-derive with
+    # the golden model whenever the weights or the threshold change.
+    for trim in (58, 59):
         await b.reset()
         n, prev = 0, 0
         for bit in bits:
@@ -357,11 +361,13 @@ async def test_detector_matches_model(dut):
     await b.reset()
 
     W1, HB, W2, thr = load_weights()
-    # This deterministic stream reaches score -10. trim=58 makes the effective
-    # threshold exactly -10, so the run checks that the RTL's comparison is
-    # strict (score == threshold must not fire), not merely that both sides stay
-    # low far away from the decision boundary.
-    trim = 58
+    # This deterministic stream reaches score -15 on the drone_dads_lvl12_s4
+    # weights (shipped threshold 5). trim=59 makes the effective threshold
+    # exactly -15, so the run checks that the RTL's comparison is strict
+    # (score == threshold must not fire), not merely that both sides stay low
+    # far away from the decision boundary. Re-derive with a golden-model sweep
+    # of the closing scores whenever the weights or the threshold change.
+    trim = 59
     det = drone_model.Detector(W1, HB, W2, thr + ((trim - 64) << 2), cfg,
                         hacc_w=HACC_W, hshift=HSHIFT, feat_off=FEAT_OFF,
                         refractory_frames=HOLD_FRAMES)
@@ -777,13 +783,14 @@ async def test_threshold_trim_arithmetic(dut):
     if GATES:
         # Internal combinational nets have no stable name after synthesis, so
         # observe the arithmetic at the classifier boundary.  For alternating
-        # input the first staggered window scores -15.  The specified formula
-        # gives thresholds -18 and -14 at adjacent trims 56 and 57, hence the
-        # former must fire and the latter must not.  This checks sign, scale,
-        # offset and strict comparison through the actual netlist outputs.
+        # input the first staggered window scores -15 on the shipped weights.
+        # With the shipped threshold 5 the formula gives -19 at trim 58 and
+        # exactly -15 at trim 59, hence the former must fire and the latter
+        # must not.  This checks sign, scale, offset and strict comparison
+        # through the actual netlist outputs.
         cfg = test_cfg()
         fired = await gate_threshold_campaign(dut, b, cfg)
-        assert fired[56] == 1 and fired[57] == 0, \
+        assert fired[58] == 1 and fired[59] == 0, \
             f"threshold boundary is wrong for score -15: {fired}"
         return
 
