@@ -100,5 +100,33 @@ jobs:
     permissions:
       pages: write # to deploy to Pages
       id-token: write # to verify the deployment originates from an appropriate source
+      actions: write # to delete this run's stale github-pages artifacts (below)
     steps:
+      # actions/deploy-pages, inside the viewer action, resolves the artifact by
+      # name within the run. Artifacts survive across re-run attempts, so every
+      # re-run of this job leaves another "github-pages" behind and the deploy
+      # fails as ambiguous ("Multiple artifacts named github-pages"). Re-running
+      # then never recovers, because each attempt adds one more. Drop whatever
+      # earlier attempts left before this attempt uploads its own.
+      - name: Drop github-pages artifacts left by earlier attempts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listWorkflowRunArtifacts,
+              { owner: context.repo.owner, repo: context.repo.repo,
+                run_id: context.runId, per_page: 100 },
+            );
+            // Name-exact on purpose: this run also holds test-results-* and the
+            // GDS outputs, and those must survive.
+            const stale = artifacts.filter(a => a.name === 'github-pages');
+            for (const a of stale) {
+              core.info(`deleting stale artifact ${a.id} (${a.name})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner, repo: context.repo.repo,
+                artifact_id: a.id,
+              });
+            }
+            core.info(`removed ${stale.length} stale github-pages artifact(s)`);
+
       - uses: TinyTapeout/tt-gds-action/viewer@ttihp26b
