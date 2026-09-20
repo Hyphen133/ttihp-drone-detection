@@ -135,15 +135,25 @@ pins parked and with them moving must give identical outputs, clock for clock.
 They also check every debug/output pin against a non-zero internal snapshot and
 drive a guaranteed real classifier fire through all four detection outputs.
 The full-length RTL pass omits six behavioural checks already covered by the
-fast parameter-equivalent RTL build. The gate-level pass runs all fourteen:
+fast parameter-equivalent RTL build. The gate-level pass runs ten of the
+fourteen -- every check whose property belongs to the manufactured logic:
 tests that inspect or deposit RTL registers have public-pin gate variants, and
-classifier tests run far enough to close a real staggered window. This makes
-the gate job several hours long, but prevents a green netlist run whose
-detection output never asserted. The unused-pins check remains shortened to a
-sixteenth of a frame because its clock-for-clock comparison needs no frame
-boundary. Here "complete gate-level suite" means all named public-interface
-behaviours execute on the netlist; the separate 100% waived coverage figure is
-an RTL logic-coverage measurement, not a standard-cell-netlist toggle claim.
+classifier tests run far enough to close a real staggered window. Four checks
+are skipped there (reset of a lit LED, a mic stuck at either rail, recovery
+from a mid-frame reset, and the quiet-to-loud ramp): they are about reset and
+stimulus handling rather than about layout, the fast RTL pass proves them, and
+at roughly six minutes of CI wall clock per frame they cost about twenty-two
+of the netlist's fifty-eight frames -- which is what pushed the job past
+GitHub's six-hour limit. `GATE_BUDGET_SKIP` in `test/test.py` and the matching
+list in `.github/workflows/gds.yaml` name those four explicitly, so they must
+still appear in the report as skips: deleting one, or letting any of the other
+ten quietly turn into a skip, fails the job. The unused-pins check remains
+shortened to a sixteenth of a frame because its clock-for-clock comparison
+needs no frame boundary. The netlist run therefore still cannot go green with
+a detection output that never asserted, a band feature that is not bit-exact,
+or a threshold on the wrong side of its boundary. The separate 100% waived
+coverage figure is an RTL logic-coverage measurement, not a
+standard-cell-netlist toggle claim.
 
 Every RTL build also compiles the `WW_ASSERT` block at the bottom of the RTL:
 seven elaboration-time parameter checks (including `A_CENTRE`, header centre

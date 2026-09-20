@@ -1,8 +1,10 @@
 # cocotb testbench for tt_um_hyphen133_drone_detection.
 #   make                    RTL, short frames (FRAME_LOG2=8, fast)
 #   FRAME_LOG2=16 make      RTL, full-rate frames (what tapes out)
-#   GATES=yes make          complete gate-level suite (several hours; the
-#                           netlist is copied in by the GDS action)
+#   GATES=yes make          gate-level suite (several hours; the netlist is
+#                           copied in by the GDS action). Four reset/stimulus
+#                           checks are skipped there to fit CI's 6 h job
+#                           limit -- see GATE_BUDGET_SKIP in test.py.
 
 SIM ?= icarus
 FST ?= -fst
